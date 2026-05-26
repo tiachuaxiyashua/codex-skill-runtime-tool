@@ -1,0 +1,24 @@
+{
+  "style_profile_id": "animagine_portrait_fantasy_v1",
+  "backend": "forge",
+  "intended_model": "animagineXLV31_v31",
+  "base_prompt_prefix": "masterpiece, best quality, very aesthetic, anime game portrait, 1girl, solo, detailed eyes, clean line art, soft cel shading, fantasy RPG character illustration",
+  "negative_prompt": "nsfw, lowres, text, watermark, logo, signature, blurry, cropped head, cut off face, jpeg artifacts, worst quality, low quality, extra person, multiple views, split screen, collage, photorealistic",
+  "generation": {
+    "sampler_name": "DPM++ 2M",
+    "steps": 28,
+    "cfg_scale": 5.5,
+    "width": 512,
+    "height": 512
+  },
+  "camera_rules": {
+    "character_portrait": "head and shoulders portrait, front three-quarter view, simple painted background"
+  },
+  "final_asset_rules": {
+    "default_target_width": 256,
+    "default_target_height": 256,
+    "padding_ratio": 0.0,
+    "require_alpha": false
+  }
+}
+

@@ -1,0 +1,23 @@
+{
+  "name": "audio",
+  "version": "0.2.0",
+  "description": "Multi-route game audio asset pipeline for Claude/Codex skill runtimes. Generates music, human voice, and game sound effects through local Stability Matrix ComfyUI workflows, validates audio, and writes manifests for Godot projects.",
+  "skills": "skills",
+  "agents": "agents",
+  "hooks": "hooks/hooks.json",
+  "mcpServers": {
+    "audio-pipeline": {
+      "transport": "stdio",
+      "command": "python",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp/audio_pipeline_server.py"
+      ],
+      "env": {
+        "COMFYUI_BASE_URL": "http://127.0.0.1:8188",
+        "COMFYUI_ROOT": "${COMFYUI_ROOT}",
+        "AUDIO_PIPELINE_ROOT": "${CLAUDE_PLUGIN_ROOT}"
+      },
+      "instructions": "Use this server when a game workflow needs generated music, dialogue voice lines, narration, ambience, stingers, UI sound effects, or creature sounds. First create or read an audio bible/style profile, then write audio_request.json. Set asset pipeline explicitly when needed: ace_step for BGM/music, qwen_tts for human voice, mmaudio for SFX/ambience/monster sounds. Call doctor to check Stability Matrix ComfyUI, requested pipeline nodes, and model files. Only call generate_audio_pack when doctor is ready. Then call validate_audio_pack and record_listening_review. Only integrate assets that pass validation and listening review. Generated audio must be written under the active project, not under the plugin."
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "project": "portrait_sample",
+  "style_profile_id": "animagine_portrait_fantasy_v1",
+  "backend": "forge",
+  "assets": [
+    {
+      "id": "hero_portrait",
+      "type": "character_portrait",
+      "usage": "dialog_portrait",
+      "description": "silver-haired young star mage, blue cloak with gold clasp, crescent brooch, calm determined expression",
+      "width": 512,
+      "height": 512,
+      "target_width": 256,
+      "target_height": 256,
+      "seed": 26052621,
+      "transparent": false,
+      "must_have": [
+        "one visible face",
+        "silver hair",
+        "blue cloak",
+        "crescent brooch"
+      ],
+      "avoid": [
+        "text",
+        "watermark",
+        "multiple characters",
+        "full body"
+      ]
+    }
+  ]
+}

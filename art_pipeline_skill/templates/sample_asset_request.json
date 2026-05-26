@@ -1,0 +1,32 @@
+{
+  "project": "pipeline_smoke",
+  "style_profile_id": "animagine_xl_2d_game_v1",
+  "backend": "forge",
+  "assets": [
+    {
+      "id": "blue_potion_icon",
+      "type": "item_icon",
+      "usage": "inventory_icon",
+      "description": "a small glowing blue mana potion bottle with cork stopper and gold rim",
+      "width": 512,
+      "height": 512,
+      "target_width": 128,
+      "target_height": 128,
+      "seed": 26052601,
+      "transparent": true,
+      "must_have": [
+        "single centered object",
+        "clean outline",
+        "readable at 32x32",
+        "flat chroma key background"
+      ],
+      "avoid": [
+        "text",
+        "watermark",
+        "hands",
+        "character",
+        "scene background"
+      ]
+    }
+  ]
+}

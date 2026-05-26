@@ -1,0 +1,5 @@
+.skill-runtime/
+config/codex_api_key.txt
+config/*.local.env
+__pycache__/
+*.pyc

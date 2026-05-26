@@ -1,0 +1,6 @@
+{
+  "name": "godot",
+  "version": "0.1.0",
+  "description": "Godot tool bridge skill for Claude/Codex skill runtimes. Provides project import, headless smoke checks, and optional gameplay test execution through a normal plugin skill instead of runtime core.",
+  "skills": "skills"
+}

@@ -1,0 +1,35 @@
+{
+  "project": "transparent_icon_sample",
+  "style_profile_id": "animagine_xl_icon_rembg_v1",
+  "backend": "forge",
+  "assets": [
+    {
+      "id": "moon_key_icon",
+      "type": "item_icon",
+      "usage": "inventory_icon",
+      "description": "a small silver crescent moon key with blue gem, clean fantasy RPG inventory icon",
+      "width": 512,
+      "height": 512,
+      "target_width": 128,
+      "target_height": 128,
+      "seed": 26052631,
+      "transparent": true,
+      "transparency_strategy": "rembg",
+      "must_have": [
+        "single centered object",
+        "silver crescent moon key",
+        "blue gem",
+        "clean outline",
+        "readable at 32x32"
+      ],
+      "avoid": [
+        "text",
+        "watermark",
+        "hands",
+        "character",
+        "scene background",
+        "multiple keys"
+      ]
+    }
+  ]
+}

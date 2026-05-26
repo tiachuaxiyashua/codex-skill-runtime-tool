@@ -1,0 +1,25 @@
+{
+  "style_profile_id": "animagine_xl_icon_rembg_v1",
+  "backend": "forge",
+  "intended_model": "animagineXLV31_v31",
+  "base_prompt_prefix": "masterpiece, best quality, very aesthetic, 2d game item icon, single centered object, clean readable silhouette, crisp dark outline, bright fantasy RPG style, simple studio background, game-ready icon readability",
+  "negative_prompt": "nsfw, lowres, text, watermark, logo, signature, username, blurry, cropped, cut off, jpeg artifacts, worst quality, low quality, unfinished, abstract, photorealistic, realistic photo, messy scene, hand, character, multiple objects, flat green background",
+  "transparency_strategy": "rembg",
+  "generation": {
+    "sampler_name": "DPM++ 2M",
+    "steps": 28,
+    "cfg_scale": 5.5,
+    "width": 512,
+    "height": 512
+  },
+  "camera_rules": {
+    "item_icon": "single isolated object only, centered orthographic icon view, no scenery, no cast shadow, simple neutral background for segmentation",
+    "skill_icon": "single isolated readable magic symbol, centered, no text, simple neutral background for segmentation"
+  },
+  "final_asset_rules": {
+    "default_target_width": 128,
+    "default_target_height": 128,
+    "padding_ratio": 0.14,
+    "require_alpha": true
+  }
+}

@@ -1,0 +1,53 @@
+﻿# Tasks
+
+- [x] 创建 OpenSpec change：`codex-runtime-equivalence`。
+- [x] 明确“100% 还原”的边界：可观察 CCGS 执行效果等价，不克隆 Claude Code 隐藏内部。
+- [x] 保持原始 `.claude/` 作为只读事实源，不修改 skill/agent/hook/settings。
+- [x] 实现 `.claude/skills`、`.claude/agents`、`.claude/docs`、`.claude/settings.json` loader。
+- [x] 实现 skill frontmatter 路由，例如 `/prototype -> prototyper`、`/team-qa -> qa-lead`。
+- [x] 增加 workflow plan/state-machine 入口，覆盖 `/prototype`、`/team-qa` 和默认 skill。
+- [x] 增加结构化 action schema：`schemas/action-result.schema.json`。
+- [x] 实现 strict action-loop：Codex 返回 action，runtime 执行 action，再回传 observation。
+- [x] 为 `--output-schema` provider 失败增加 prompt-only JSON fallback。
+- [x] 实现 Read、Glob、Grep runtime 工具。
+- [x] 实现 Write、Edit runtime 工具，并禁止写入 `.claude`。
+- [x] 增加 MultiEdit、Agent、TodoWrite、Skill、WebFetch、WebSearch 和 MCP 占位 action。
+- [x] 实现 Bash runtime 工具，并遵守 `.claude/settings.json` deny 规则。
+- [x] 实现 Task runtime 工具，用独立 Codex 会话模拟子代理。
+- [x] 实现同一轮多个 Task action 的并发执行。
+- [x] 实现 AskUserQuestion runtime 工具，支持自动化时 `--assume-yes`。
+- [x] 实现 Godot smoke/gameplay test runtime 工具。
+- [x] 调度 SessionStart、Stop、SubagentStart、SubagentStop、PreToolUse、PostToolUse hooks。
+- [x] 实现 Windows CRLF `.sh` hook 的 session-local LF shim。
+- [x] 支持 repo-root `skills/`、repo-root `agents/`、根目录 `<skill>/SKILL.md` GitHub Claude skill 布局。
+- [x] 支持 supporting file 清单、`$ARGUMENTS` 基础替换和 `hooks/hooks.json` 的 skill hook 注入。
+- [x] 增加 strict 主 skill 的 `allowed-tools` 基础限制和 Claude 工具名别名。
+- [x] 把 skill `allowed-tools` 从硬限制修正为预批准提示，并实现 settings `deny`/`ask`/`allow` 权限决策。
+- [x] 支持 `.claude/commands`、repo-root `commands/`、插件 `commands/` 和递归 agent 目录发现。
+- [x] 支持 `.claude-plugin/plugin.json` 插件根发现、默认组件目录、插件 namespace 和插件 hook 合并。
+- [x] 在 hook、prompt 动态上下文和 allowed-tools 中解析 `${CLAUDE_PLUGIN_ROOT}`。
+- [x] 支持 skill/command body 的 `` !`command` `` 动态上下文注入，并保留失败诊断。
+- [x] 让 `Skill` action 对 `context: fork` skill 走独立子会话近似 Claude fork 语义。
+- [x] 增加 `.mcp.json` 和插件 `mcpServers` 的 stdio MCP bridge。
+- [x] 用创业流程、编程 command、官方插件样本补充 live/dry-run 兼容验证。
+- [x] 实现 QA gate：无 `VERDICT` 或 PASS 无 `EVIDENCE MATRIX` 时 BLOCKED。
+- [x] 对 Godot/engine 原型强制追加 `qa-tester`。
+- [x] 强化 QA prompt，要求验证移动、墙阻挡、金币、胜利、重启、HUD 步数每步更新。
+- [x] 将 prompt、命令、工具结果、hook 结果、gate 结果写入 `.codex-skill-runtime/sessions/`。
+- [x] 增加 `inspect`、`run`、`agent`、`godot-smoke`、`strict-smoke`、`selftest` CLI。
+- [x] 增加 selftest 覆盖 loader、frontmatter、Task、QA gate、dry-run、strict dry-run、tool executor、hook shim、Godot、live strict、live QA、`.claude` clean。
+- [x] 运行 `openspec validate codex-runtime-equivalence --strict`。
+- [x] 运行 Python compile 校验。
+- [x] 运行完整 live selftest：strict action-loop、Godot headless、真实 `qa-tester`。
+- [x] 从 GitHub 下载多个 Claude Code skill 仓库并实跑代表 skill。
+- [x] 确认 `.claude` 在自测后仍然没有 diff。
+- [x] 补齐 Claude command 预处理：`$1/$2`、`$ARGUMENTS[index]`、`@file`、`@$1`、`@${CLAUDE_PLUGIN_ROOT}/file`。
+- [x] 修正 plugin manifest 自定义 component 路径语义：自定义 `commands/skills/agents/hooks` 补充默认目录，不替代默认目录。
+- [x] 扩展 plugin MCP 发现来源：插件根 `.mcp.json`、manifest 内联 `mcpServers`、manifest 指向的 MCP JSON 文件。
+- [x] 强化 hook 输入输出协议：Claude-like payload、`permissionDecision`、`updatedInput`、`continue:false`、`decision:block|deny`、exit code `2`。
+- [x] 增加 `UserPromptSubmit`、`SessionEnd` 调度，并让 Stop/SubagentStop block 决策影响 gate 或退出码。
+- [x] 增加 prompt hook runner 入口，真实运行时用 Codex CLI 执行，selftest 用 fake runner 验证协议。
+- [x] 新增 selftest：command-preprocessing-contract、plugin-manifest-contract、hook-decision-contract；普通 selftest 更新为 17 项。
+- [x] 增加远程 MCP bridge：HTTP streamable JSON-RPC、SSE endpoint/message、WebSocket best-effort、静态 headers、headersHelper、环境变量展开和 401/403 认证边界提示。
+- [x] 增加 session memory/compaction 近似机制：`summary.json`、`.codex-skill-runtime/sessions-index.json`、后续 prompt 的 bounded runtime memory 注入。
+- [x] 新增 selftest：HTTP/SSE MCP bridge、headersHelper 环境变量、memory-compaction-contract；普通 selftest 更新为 18 项。

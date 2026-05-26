@@ -1,0 +1,22 @@
+{
+  "name": "art",
+  "version": "0.1.0",
+  "description": "2D game art asset production pipeline for Claude/Codex skill runtimes. Uses a local Forge/A1111-compatible backend, validates generated PNG assets, and writes manifests for Godot projects.",
+  "skills": "skills",
+  "agents": "agents",
+  "hooks": "hooks/hooks.json",
+  "mcpServers": {
+    "asset-pipeline": {
+      "transport": "stdio",
+      "command": "python",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp/asset_pipeline_server.py"
+      ],
+      "env": {
+        "FORGE_BASE_URL": "http://127.0.0.1:7860",
+        "ASSET_PIPELINE_ROOT": "${CLAUDE_PLUGIN_ROOT}"
+      },
+      "instructions": "Use this server when a game workflow needs real 2D art assets. First create or read an art bible/style profile, then write asset_request.json, call generate_asset_pack, call validate_asset_pack, and only integrate assets that pass validation. For Godot projects, generated assets must be written under the active project, not under the plugin."
+    }
+  }
+}

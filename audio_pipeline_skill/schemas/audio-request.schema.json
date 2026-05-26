@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Game Audio Request",
+  "type": "object",
+  "required": ["project", "style_profile_id", "assets"],
+  "properties": {
+    "project": { "type": "string" },
+    "style_profile_id": { "type": "string" },
+    "backend": { "type": "string", "default": "comfyui" },
+    "style": { "type": "object" },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "description"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "type": "string" },
+          "pipeline": {
+            "type": "string",
+            "description": "Optional explicit route: ace_step for BGM/music, qwen_tts for human voice, mmaudio for SFX/ambience/monster audio."
+          },
+          "route": { "type": "string" },
+          "engine": { "type": "string" },
+          "generator": { "type": "string" },
+          "usage": { "type": "string" },
+          "description": { "type": "string" },
+          "prompt": { "type": "string" },
+          "text": { "type": "string" },
+          "script": { "type": "string" },
+          "line": { "type": "string" },
+          "dialogue": { "type": "string" },
+          "tags": { "type": "string" },
+          "lyrics": { "type": "string" },
+          "negative_prompt": { "type": "string" },
+          "duration_seconds": { "type": "number" },
+          "target_duration_seconds": { "type": "number" },
+          "loop": { "type": "boolean" },
+          "bpm": { "type": "integer" },
+          "keyscale": { "type": "string" },
+          "timesignature": { "type": "string" },
+          "language": { "type": "string" },
+          "seed": { "type": "integer" },
+          "format": { "type": "string" },
+          "speaker": { "type": "string" },
+          "voice": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "object" }
+            ]
+          },
+          "instruct": { "type": "string" },
+          "voice_instruct": { "type": "string" },
+          "model_size": { "type": "string" },
+          "max_new_tokens": { "type": "integer" },
+          "steps": { "type": "integer" },
+          "cfg": { "type": "number" },
+          "cfg_scale": { "type": "number" },
+          "precision": { "type": "string" },
+          "base_precision": { "type": "string" },
+          "mode": { "type": "string" },
+          "must_have": { "type": "array", "items": { "type": "string" } },
+          "avoid": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "project": "audio_pipeline_sample",
+  "style_profile_id": "ace_step_game_audio_v1",
+  "backend": "comfyui",
+  "assets": [
+    {
+      "id": "forest_menu_loop",
+      "type": "music_loop",
+      "pipeline": "ace_step",
+      "usage": "main_menu",
+      "description": "short calm enchanted forest menu loop with soft bells, warm pads, light plucked strings, gentle fantasy mood",
+      "duration_seconds": 6.0,
+      "target_duration_seconds": 6.0,
+      "loop": true,
+      "bpm": 90,
+      "keyscale": "E minor",
+      "timesignature": "4",
+      "language": "en",
+      "seed": 26052641,
+      "format": "wav",
+      "must_have": [
+        "calm fantasy mood",
+        "soft bells",
+        "light plucked strings",
+        "loopable ending"
+      ],
+      "avoid": [
+        "vocals",
+        "speech",
+        "clipping",
+        "drums too loud",
+        "abrupt ending"
+      ]
+    },
+    {
+      "id": "elder_greeting_cn",
+      "type": "voice_line",
+      "pipeline": "qwen_tts",
+      "usage": "npc_dialogue",
+      "description": "Chinese elder NPC greeting line",
+      "text": "年轻的冒险者，森林正在呼唤你的名字。",
+      "language": "zh",
+      "speaker": "Ryan",
+      "voice_instruct": "温和、清晰、略带神秘感的中文男声，适合奇幻 RPG NPC。",
+      "model_size": "0.6B",
+      "max_new_tokens": 512,
+      "target_duration_seconds": 4.0,
+      "seed": 26052642,
+      "format": "wav",
+      "avoid": [
+        "background music",
+        "noise",
+        "clipping"
+      ]
+    },
+    {
+      "id": "cave_monster_growl",
+      "type": "monster_sfx",
+      "pipeline": "mmaudio",
+      "usage": "enemy_warning",
+      "description": "short low monster growl in a dark cave, game sound effect, no music, no speech",
+      "duration_seconds": 2.0,
+      "target_duration_seconds": 2.0,
+      "steps": 8,
+      "cfg": 4.5,
+      "seed": 26052643,
+      "format": "wav",
+      "must_have": [
+        "low monster growl",
+        "dark cave ambience"
+      ],
+      "avoid": [
+        "music",
+        "human speech",
+        "clipping"
+      ]
+    }
+  ]
+}

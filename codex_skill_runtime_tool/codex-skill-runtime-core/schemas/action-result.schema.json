@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Skill Runtime Action Response",
+  "type": "object",
+  "required": ["status", "summary", "actions", "final"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["action_required", "final", "blocked"]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["tool", "reason", "parameters"],
+        "properties": {
+          "tool": {
+            "type": "string",
+            "enum": [
+              "read_file",
+              "glob",
+              "grep",
+              "write_file",
+              "edit_file",
+              "multi_edit",
+              "bash",
+              "task",
+              "agent",
+              "ask_user_question",
+              "todo_write",
+              "skill",
+              "project_memory_read",
+              "project_memory_write",
+              "asset_register",
+              "send_message",
+              "task_stop",
+              "memory_read",
+              "memory_write",
+              "bridge",
+              "voice",
+              "ide",
+              "web_fetch",
+              "web_search",
+              "mcp"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "parameters": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "final": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

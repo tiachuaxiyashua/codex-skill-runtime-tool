@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "2D Asset Request",
+  "type": "object",
+  "required": ["project", "style_profile_id", "assets"],
+  "properties": {
+    "project": { "type": "string" },
+    "style_profile_id": { "type": "string" },
+    "backend": { "type": "string", "default": "forge" },
+    "style": { "type": "object" },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "description"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "type": "string" },
+          "description": { "type": "string" },
+          "usage": { "type": "string" },
+          "width": { "type": "integer", "default": 512 },
+          "height": { "type": "integer", "default": 512 },
+          "target_width": { "type": "integer" },
+          "target_height": { "type": "integer" },
+          "seed": { "type": "integer" },
+          "transparent": { "type": "boolean", "default": true },
+          "must_have": { "type": "array", "items": { "type": "string" } },
+          "avoid": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

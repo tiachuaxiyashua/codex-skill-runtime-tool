@@ -1,0 +1,25 @@
+# Secrets and local credentials
+codex_skill_runtime_tool/config/codex_api_key.txt
+codex_skill_runtime_tool/config/*.local.env
+*.local.env
+.env
+.env.*
+
+# Runtime state, caches, and local evidence
+codex_skill_runtime_tool/.skill-runtime/
+**/.skill-runtime/
+**/__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# Generated test games and temporary package outputs
+game_projects/
+codex_skill_packages/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

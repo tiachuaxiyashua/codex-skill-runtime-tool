@@ -1,0 +1,28 @@
+{
+  "style_profile_id": "animagine_xl_2d_game_v1",
+  "backend": "forge",
+  "intended_model": "animagineXLV31_v31",
+  "base_prompt_prefix": "masterpiece, best quality, very aesthetic, 2d game asset, clean readable silhouette, crisp dark outline, bright fantasy RPG style, centered subject, simple shape language, game-ready icon readability",
+  "negative_prompt": "nsfw, lowres, text, watermark, logo, signature, username, blurry, cropped, cut off, jpeg artifacts, worst quality, low quality, unfinished, extra digits, abstract, photorealistic, realistic photo, messy background",
+  "transparent_strategy": "chroma_key",
+  "chroma_key": "#00ff00",
+  "generation": {
+    "sampler_name": "Euler a",
+    "steps": 20,
+    "cfg_scale": 6.0,
+    "width": 512,
+    "height": 512
+  },
+  "camera_rules": {
+    "item_icon": "centered single object, no hand, no character, no scenery",
+    "skill_icon": "centered readable magic effect symbol, no text",
+    "character_portrait": "front three-quarter bust portrait",
+    "character_sprite": "single full-body character, top-down three-quarter game view"
+  },
+  "final_asset_rules": {
+    "default_target_width": 128,
+    "default_target_height": 128,
+    "padding_ratio": 0.12,
+    "require_alpha": true
+  }
+}

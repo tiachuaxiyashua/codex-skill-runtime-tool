@@ -123,6 +123,11 @@ class ToolExecutor:
         }
         handler = handlers.get(tool)
 
+        tool_node = self.session.start_node(
+            "tool",
+            tool,
+            metadata={"tool": tool, "current_action": str(action.get("reason", "")), "parameters": _compact_parameters(parameters)},
+        )
         self.session.event("tool.start", f"{tool}: {action.get('reason', '')}", parameters=parameters)
         if handler is None:
             result = ToolResult(tool=tool, status="ERROR", summary=f"unknown tool: {tool}", data={})
@@ -171,7 +176,13 @@ class ToolExecutor:
         tool_id = self._next_tool_id()
         result = compact_tool_result(result, session_dir=self.session.dir, tool_id=tool_id)
         self.session.event("tool.finish", result.summary, result=asdict(result))
-        self.session.write_json(f"tools/{tool_id}-{tool}.json", asdict(result))
+        result_path = self.session.write_json(f"tools/{tool_id}-{tool}.json", asdict(result))
+        self.session.finish_node(
+            tool_node,
+            status=_status_for_tool_result(result),
+            evidence={"tool_result": str(result_path), "summary": result.summary},
+            metadata={"tool_id": tool_id},
+        )
         return result
 
     def _read_file(self, parameters: dict[str, Any]) -> ToolResult:
@@ -253,6 +264,7 @@ class ToolExecutor:
         content = str(parameters.get("content", ""))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8", newline="\n")
+        self.session.add_artifact(path, metadata={"tool": "write_file", "bytes": len(content.encode("utf-8"))})
         return ToolResult("write_file", "OK", f"Wrote {path}", {"path": str(path), "bytes": len(content.encode("utf-8"))})
 
     def _edit_file(self, parameters: dict[str, Any]) -> ToolResult:
@@ -264,6 +276,7 @@ class ToolExecutor:
             raise ToolExecutionError(f"old text not found in {path}")
         updated = text.replace(old, new, 1)
         path.write_text(updated, encoding="utf-8", newline="\n")
+        self.session.add_artifact(path, metadata={"tool": "edit_file", "replacements": 1})
         return ToolResult("edit_file", "OK", f"Edited {path}", {"path": str(path), "replacements": 1})
 
     def _multi_edit(self, parameters: dict[str, Any]) -> ToolResult:
@@ -283,6 +296,7 @@ class ToolExecutor:
             text = text.replace(old, new, 1)
             replacements += 1
         path.write_text(text, encoding="utf-8", newline="\n")
+        self.session.add_artifact(path, metadata={"tool": "multi_edit", "replacements": replacements})
         return ToolResult("multi_edit", "OK", f"Edited {path}", {"path": str(path), "replacements": replacements})
 
     def _bash(self, parameters: dict[str, Any]) -> ToolResult:
@@ -372,12 +386,19 @@ class ToolExecutor:
         if not isinstance(options, list):
             options = []
         if not self.assume_yes:
+            question_node = self.session.start_node(
+                "question",
+                "user-input",
+                status="waiting_user",
+                metadata={"question": question, "options": options},
+            )
             pending = record_pending_question(
                 self.session,
                 question=question,
                 options=options,
                 default=str(parameters.get("default")) if parameters.get("default") is not None else None,
             )
+            self.session.update_node(question_node, evidence={"pending_question": str(self.session.path("pending-question.json"))})
             return ToolResult(
                 "ask_user_question",
                 "BLOCKED",
@@ -510,6 +531,9 @@ class ToolExecutor:
         if not isinstance(asset, dict):
             raise ToolExecutionError("asset_register requires an object")
         path = record_asset(self.project_root, asset)
+        asset_path = asset.get("path") or asset.get("file") or asset.get("asset_path")
+        if asset_path:
+            self.session.add_artifact(str(asset_path), metadata={"tool": "asset_register", "manifest": str(path), "asset": asset})
         return ToolResult(
             "asset_register",
             "OK",
@@ -1035,6 +1059,30 @@ def _display_read_path(path: Path, project_root: Path) -> str:
         return str(resolved.relative_to(project_root))
     except ValueError:
         return str(resolved)
+
+
+def _status_for_tool_result(result: ToolResult) -> str:
+    if result.status == "OK":
+        return "done"
+    if result.status == "BLOCKED":
+        return "blocked"
+    return "failed"
+
+
+def _compact_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    compacted: dict[str, Any] = {}
+    for key, value in parameters.items():
+        if isinstance(value, str):
+            compacted[key] = value[:500]
+        elif isinstance(value, (int, float, bool)) or value is None:
+            compacted[key] = value
+        elif isinstance(value, list):
+            compacted[key] = value[:20]
+        elif isinstance(value, dict):
+            compacted[key] = {str(k): str(v)[:200] for k, v in list(value.items())[:20]}
+        else:
+            compacted[key] = str(value)[:500]
+    return compacted
 
 
 def _mcp_failure(result: dict[str, Any]) -> tuple[str, str] | None:

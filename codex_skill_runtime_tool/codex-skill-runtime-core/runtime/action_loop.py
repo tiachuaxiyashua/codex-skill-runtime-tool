@@ -167,16 +167,25 @@ class StrictActionLoop:
         return ActionLoopResult("BLOCKED", f"Maximum strict action steps reached: {self.max_steps}", codex_runs, tool_results)
 
     def _execute_actions(self, actions: list[Any]) -> list[ToolResult]:
-        if len(actions) > 1 and all(isinstance(action, dict) and action.get("tool") in {"task", "agent"} for action in actions):
+        if len(actions) > 1 and all(isinstance(action, dict) and _action_tool_name(action) in {"task", "agent"} for action in actions):
+            group_node = self.session.start_node(
+                "parallel_group",
+                "parallel agents",
+                metadata={"count": len(actions)},
+            )
             ordered: list[ToolResult | None] = [None] * len(actions)
-            with ThreadPoolExecutor(max_workers=min(len(actions), 4)) as executor:
-                future_map = {
-                    executor.submit(self.tool_executor.execute, action): index
-                    for index, action in enumerate(actions)
-                }
-                for future in as_completed(future_map):
-                    ordered[future_map[future]] = future.result()
-            return [result for result in ordered if result is not None]
+            try:
+                with ThreadPoolExecutor(max_workers=min(len(actions), 4)) as executor:
+                    future_map = {
+                        executor.submit(self.tool_executor.execute, action): index
+                        for index, action in enumerate(actions)
+                    }
+                    for future in as_completed(future_map):
+                        ordered[future_map[future]] = future.result()
+                return [result for result in ordered if result is not None]
+            finally:
+                status = "done" if all(result is not None and result.status == "OK" for result in ordered) else "failed"
+                self.session.finish_node(group_node, status=status)
 
         results: list[ToolResult] = []
         for action in actions:
@@ -286,6 +295,10 @@ def _blocked_question_message(result: ToolResult) -> str:
     if hint:
         lines.extend(["", f"Resume hint: {hint}"])
     return "\n".join(lines).strip()
+
+
+def _action_tool_name(action: dict[str, Any]) -> str:
+    return str(action.get("tool", action.get("type", ""))).strip().lower().replace("-", "_")
 
 
 def _raw_json_prompt(prompt: str) -> str:

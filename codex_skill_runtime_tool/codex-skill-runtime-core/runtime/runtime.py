@@ -134,6 +134,13 @@ class CodexSkillRuntime:
             explicit_output_style=self.output_style,
         )
         session.event("session.start", f"Starting /{clean_command}", arguments=arguments)
+        session.set_status("running")
+        skill_node = session.start_node(
+            "skill",
+            clean_command,
+            display_name=f"/{clean_command}",
+            metadata={"command": clean_command, "arguments": arguments, "agent": agent_name},
+        )
         session.write_json("workflow-plan.json", build_workflow_plan(clean_command, arguments, self.qa_mode).to_dict())
         hooks.fire(
             "UserPromptSubmit",
@@ -164,6 +171,12 @@ class CodexSkillRuntime:
             qa_mode=self.qa_mode,
             runtime_profile=self._runtime_profile(profile, skill=skill, agent=agent),
         )
+        primary_node = session.start_node(
+            "agent",
+            agent_name,
+            parent_id=skill_node,
+            metadata={"purpose": f"Execute /{clean_command}", "skill": clean_command},
+        )
         primary = self.codex.exec_prompt(
             session=session,
             label=f"skill-{clean_command}",
@@ -172,6 +185,16 @@ class CodexSkillRuntime:
             dry_run=self.dry_run,
             model=profile.model,
             reasoning_effort=profile.effort,
+        )
+        session.finish_node(
+            primary_node,
+            status="done" if primary.returncode == 0 else "failed",
+            evidence={
+                "prompt": str(primary.prompt_path),
+                "stdout": str(primary.stdout_path),
+                "stderr": str(primary.stderr_path),
+                "last_message": str(primary.last_message_path),
+            },
         )
 
         tasks: list[CodexRunResult] = []
@@ -203,6 +226,13 @@ class CodexSkillRuntime:
                 gates.append(GateResult("QA", "DRY-RUN", "QA prompt was prepared but not executed."))
             else:
                 gates.append(evaluate_qa_report(qa_result.last_message))
+            session.start_node(
+                "gate",
+                "QA",
+                parent_id=skill_node,
+                status=_node_status_for_gate(gates[-1]),
+                metadata={"reason": gates[-1].reason},
+            )
 
         stop_results = hooks.fire(
             "Stop",
@@ -235,6 +265,8 @@ class CodexSkillRuntime:
             notes=(primary.last_message[:4000] if primary else ""),
             gates=gates,
         )
+        session.finish_node(skill_node, status="done" if exit_code == 0 else "failed")
+        session.set_status("done" if exit_code == 0 else "failed")
         return RuntimeResult(session=session, primary=primary, tasks=tasks, gates=gates, exit_code=exit_code)
 
     def run_strict_skill(self, command: str, arguments: str, max_steps: int = 8) -> RuntimeResult:
@@ -251,6 +283,13 @@ class CodexSkillRuntime:
             explicit_output_style=self.output_style,
         )
         session.event("session.start", f"Starting strict /{clean_command}", arguments=arguments)
+        session.set_status("running")
+        skill_node = session.start_node(
+            "skill",
+            clean_command,
+            display_name=f"/{clean_command}",
+            metadata={"command": clean_command, "arguments": arguments, "agent": agent_name, "strict_tools": True},
+        )
         session.write_json("workflow-plan.json", build_workflow_plan(clean_command, arguments, self.qa_mode).to_dict())
         hooks.fire(
             "UserPromptSubmit",
@@ -316,6 +355,12 @@ class CodexSkillRuntime:
             reasoning_effort=profile.effort,
             use_output_schema=self.strict_schema,
         )
+        primary_node = session.start_node(
+            "agent",
+            agent_name,
+            parent_id=skill_node,
+            metadata={"purpose": f"Strict execute /{clean_command}", "skill": clean_command},
+        )
         loop_result = loop.run(
             command=clean_command,
             arguments=arguments,
@@ -328,6 +373,7 @@ class CodexSkillRuntime:
             qa_mode=self.qa_mode,
             dry_run=self.dry_run,
         )
+        session.finish_node(primary_node, status="done" if loop_result.status in {"FINAL", "DRY-RUN"} else "blocked")
         session.write_json(
             "strict-result.json",
             {
@@ -347,6 +393,13 @@ class CodexSkillRuntime:
             gates.append(GateResult("STRICT", "DRY-RUN", "Strict action prompt was prepared but not executed."))
         else:
             gates.append(GateResult("STRICT", "PASS", "Strict action loop reached final status."))
+        session.start_node(
+            "gate",
+            "STRICT",
+            parent_id=skill_node,
+            status=_node_status_for_gate(gates[-1]),
+            metadata={"reason": gates[-1].reason},
+        )
 
         if loop_result.status not in {"BLOCKED", "DRY-RUN"} and self._should_run_required_qa(clean_command, arguments):
             qa_result = self._run_required_qa(
@@ -356,6 +409,13 @@ class CodexSkillRuntime:
             )
             tasks.append(qa_result)
             gates.append(evaluate_qa_report(qa_result.last_message))
+            session.start_node(
+                "gate",
+                "QA",
+                parent_id=skill_node,
+                status=_node_status_for_gate(gates[-1]),
+                metadata={"reason": gates[-1].reason},
+            )
 
         stop_results = hooks.fire(
             "Stop",
@@ -389,6 +449,8 @@ class CodexSkillRuntime:
             notes=loop_result.final[:4000],
             gates=gates,
         )
+        session.finish_node(skill_node, status="done" if exit_code == 0 else "failed")
+        session.set_status("done" if exit_code == 0 else "failed")
         return RuntimeResult(session=session, primary=primary, tasks=tasks, gates=gates, exit_code=exit_code)
 
     def run_agent(self, agent_name: str, prompt_text: str) -> RuntimeResult:
@@ -400,6 +462,13 @@ class CodexSkillRuntime:
             project_root=self.project_root,
             assume_yes=self.assume_yes,
             explicit_output_style=self.output_style,
+        )
+        session.event("session.start", f"Starting agent {agent_name}", arguments=prompt_text)
+        session.set_status("running")
+        agent_node = session.start_node(
+            "agent",
+            agent_name,
+            metadata={"purpose": "Direct agent invocation", "prompt": prompt_text[:1000]},
         )
         context = self._context_bundle(session=session)
         hooks.fire(
@@ -461,6 +530,18 @@ class CodexSkillRuntime:
             notes=result.last_message[:4000],
             gates=gates,
         )
+        session.finish_node(
+            agent_node,
+            status="done" if exit_code == 0 else "failed",
+            evidence={
+                "prompt": str(result.prompt_path),
+                "stdout": str(result.stdout_path),
+                "stderr": str(result.stderr_path),
+                "last_message": str(result.last_message_path),
+            },
+        )
+        session.event("session.stop", f"Finished agent {agent_name}")
+        session.set_status("done" if exit_code == 0 else "failed")
         return RuntimeResult(session=session, primary=result, tasks=[], gates=gates, exit_code=exit_code)
 
     def resume_session(self, session_or_path: str, prompt_text: str = "") -> RuntimeResult:
@@ -468,6 +549,8 @@ class CodexSkillRuntime:
         context = replay_context(self.project_root, session_or_path)
         question_context = pending_question_context(self.project_root, session_or_path)
         session.event("session.start", "Starting transcript resume", source=session_or_path)
+        session.set_status("running")
+        resume_node = session.start_node("skill", "resume", metadata={"source": session_or_path, "prompt": prompt_text[:1000]})
         prompt = (
             "# Runtime Transcript Resume\n\n"
             "Continue from the reconstructed prior runtime transcript. Do not assume files are unchanged; verify live files before editing.\n\n"
@@ -498,6 +581,8 @@ class CodexSkillRuntime:
             notes=result.last_message[:4000],
             gates=[],
         )
+        session.finish_node(resume_node, status="done" if result.returncode == 0 else "failed")
+        session.set_status("done" if result.returncode == 0 else "failed")
         return RuntimeResult(session=session, primary=result, tasks=[], gates=[], exit_code=result.returncode)
 
     def answer_question(self, session_or_path: str, answer: str) -> RuntimeResult:
@@ -512,6 +597,13 @@ class CodexSkillRuntime:
     def run_strict_smoke(self, read_path: str = "README.md", max_steps: int = 3) -> RuntimeResult:
         session = RuntimeSession(self.project_root, "strict-smoke")
         session.event("session.start", "Starting strict smoke", read_path=read_path)
+        session.set_status("running")
+        skill_node = session.start_node(
+            "skill",
+            "strict-smoke",
+            display_name="/strict-smoke",
+            metadata={"read_path": read_path, "strict_tools": True},
+        )
         self.hooks.fire(
             "UserPromptSubmit",
             payload={"user_prompt": f"/strict-smoke {read_path}", "strict_tools": True},
@@ -559,6 +651,12 @@ class CodexSkillRuntime:
             max_steps=max_steps,
             use_output_schema=self.strict_schema,
         )
+        agent_node = session.start_node(
+            "agent",
+            "strict-smoke-agent",
+            parent_id=skill_node,
+            metadata={"purpose": "Strict runtime smoke test"},
+        )
         loop_result = loop.run(
             command="strict-smoke",
             arguments=read_path,
@@ -569,6 +667,7 @@ class CodexSkillRuntime:
             qa_mode="off",
             dry_run=self.dry_run,
         )
+        session.finish_node(agent_node, status="done" if loop_result.status in {"FINAL", "DRY-RUN"} else "blocked")
         session.write_json(
             "strict-result.json",
             {
@@ -614,6 +713,8 @@ class CodexSkillRuntime:
             notes=loop_result.final[:4000],
             gates=gates,
         )
+        session.finish_node(skill_node, status="done" if exit_code == 0 else "failed")
+        session.set_status("done" if exit_code == 0 else "failed")
         return RuntimeResult(session=session, primary=primary, tasks=[], gates=gates, exit_code=exit_code)
 
     def _run_agent_task(
@@ -650,6 +751,11 @@ class CodexSkillRuntime:
             payload={"agent_type": agent_name, "agent": agent_name, "purpose": purpose},
             session=session,
             dry_run=self.dry_run,
+        )
+        agent_node = session.start_node(
+            "agent",
+            agent_name,
+            metadata={"purpose": purpose, "parent_command": parent_command, "task_index": index},
         )
         if strict_tools:
             task_skill = MarkdownDocument(
@@ -772,6 +878,16 @@ class CodexSkillRuntime:
         if stop_block:
             result.returncode = max(result.returncode, 2)
             session.event("hook.blocked", "SubagentStop hook blocked task", agent=agent_name, reason=stop_block)
+        session.finish_node(
+            agent_node,
+            status="done" if result.returncode == 0 else "failed",
+            evidence={
+                "prompt": str(result.prompt_path),
+                "stdout": str(result.stdout_path),
+                "stderr": str(result.stderr_path),
+                "last_message": str(result.last_message_path),
+            },
+        )
         return result
 
     def _load_routed_agent(self, command: str, skill: MarkdownDocument) -> tuple[str, MarkdownDocument]:
@@ -831,6 +947,11 @@ class CodexSkillRuntime:
             session=session,
             dry_run=self.dry_run,
         )
+        qa_node = session.start_node(
+            "agent",
+            "qa-tester",
+            metadata={"purpose": "Required runtime QA pass"},
+        )
         prompt = qa_prompt(
             task_agent=agent,
             project_root=self.project_root,
@@ -850,6 +971,16 @@ class CodexSkillRuntime:
             payload={"agent_type": "qa-tester", "agent": "qa-tester", "returncode": result.returncode},
             session=session,
             dry_run=self.dry_run,
+        )
+        session.finish_node(
+            qa_node,
+            status="done" if result.returncode == 0 else "failed",
+            evidence={
+                "prompt": str(result.prompt_path),
+                "stdout": str(result.stdout_path),
+                "stderr": str(result.stderr_path),
+                "last_message": str(result.last_message_path),
+            },
         )
         return result
 
@@ -1014,3 +1145,11 @@ class CodexSkillRuntime:
 
 def _runtime_schema_path() -> Path:
     return Path(__file__).resolve().parents[1] / "schemas" / "action-result.schema.json"
+
+
+def _node_status_for_gate(gate: GateResult) -> str:
+    if gate.status in {"PASS", "WARN", "DRY-RUN"}:
+        return "passed"
+    if gate.status == "BLOCKED":
+        return "blocked"
+    return "failed"

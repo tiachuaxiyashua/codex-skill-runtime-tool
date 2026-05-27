@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Skill Runtime UI</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">CSR</div>
+          <div>
+            <h1>Skill Runtime</h1>
+            <p>通用任务观察器</p>
+          </div>
+        </div>
+
+        <section class="panel launch-panel">
+          <div class="panel-title">新任务</div>
+          <label for="skill-filter">选择 Skill</label>
+          <input id="skill-filter" placeholder="搜索，例如 ccgs、art、audio、godot" />
+          <select id="skill-select" class="skill-select">
+            <option value="">手动输入 slash command</option>
+          </select>
+          <label for="run-command">Slash command</label>
+          <input id="run-command" placeholder="/ccgs:prototype 或 /art:2d-art-pipeline" />
+          <label for="run-arguments">任务说明</label>
+          <textarea id="run-arguments" rows="4" placeholder="输入你希望 skill 完成的任务"></textarea>
+          <div class="run-options">
+            <label class="check-row">
+              <input id="strict-tools" type="checkbox" />
+              <span>启用 runtime 结构化工具循环</span>
+            </label>
+            <label for="qa-mode">QA 模式</label>
+            <select id="qa-mode">
+              <option value="auto">auto</option>
+              <option value="off">off</option>
+              <option value="required">required</option>
+            </select>
+            <label for="max-steps">最大步骤</label>
+            <input id="max-steps" type="number" min="1" max="80" value="8" />
+          </div>
+          <button id="run-button">启动任务</button>
+          <div id="run-result" class="tiny-muted"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title row-between">
+            <span>可用 Skill</span>
+            <span id="skill-count" class="tiny-muted">加载中</span>
+          </div>
+          <div id="skill-list" class="skill-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title row-between">
+            <span>历史任务</span>
+            <button id="refresh-button" class="ghost">刷新</button>
+          </div>
+          <div id="session-list" class="session-list"></div>
+        </section>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">当前会话</div>
+            <h2 id="session-title">未选择任务</h2>
+          </div>
+          <div id="health-strip" class="health-strip"></div>
+        </header>
+
+        <section id="current-status" class="current-status">
+          <div class="status-card">
+            <span class="label">状态</span>
+            <strong id="current-state">idle</strong>
+          </div>
+          <div class="status-card">
+            <span class="label">当前 Skill</span>
+            <strong id="current-skill">-</strong>
+          </div>
+          <div class="status-card">
+            <span class="label">当前 Agent</span>
+            <strong id="current-agent">-</strong>
+          </div>
+          <div class="status-card">
+            <span class="label">并行 Agent</span>
+            <strong id="parallel-count">0</strong>
+          </div>
+        </section>
+
+        <section id="question-banner" class="question-banner hidden">
+          <div>
+            <strong>需要用户回答</strong>
+            <p id="question-text"></p>
+            <div id="question-options" class="question-options"></div>
+          </div>
+          <div class="question-input">
+            <input id="answer-input" placeholder="输入答案后继续" />
+            <button id="answer-button">提交并继续</button>
+          </div>
+        </section>
+
+        <div class="workspace-grid">
+          <section class="panel tree-panel">
+            <div class="panel-title">任务树</div>
+            <div id="task-tree" class="task-tree"></div>
+          </section>
+
+          <section class="panel lanes-panel">
+            <div class="panel-title">并行 Agent 泳道</div>
+            <div id="agent-lanes" class="agent-lanes"></div>
+          </section>
+
+          <section class="panel detail-panel">
+            <div class="panel-title">节点 / 文件详情</div>
+            <div id="node-detail" class="node-detail empty">点击任务树节点或证据文件查看详情</div>
+          </section>
+
+          <section class="panel timeline-panel">
+            <div class="panel-title">事件时间线</div>
+            <div id="timeline" class="timeline"></div>
+          </section>
+
+          <section class="panel artifact-panel">
+            <div class="panel-title">产物</div>
+            <div id="artifacts" class="artifacts"></div>
+          </section>
+
+          <section class="panel files-panel">
+            <div class="panel-title">证据文件</div>
+            <div id="files" class="files"></div>
+          </section>
+        </div>
+
+        <section class="panel resume-panel">
+          <div class="panel-title">断点继续</div>
+          <div class="resume-row">
+            <input id="resume-prompt" placeholder="补充说明，例如：继续上次任务，先检查文件状态再执行" />
+            <button id="resume-button">从当前 Session 继续</button>
+          </div>
+          <div id="resume-result" class="tiny-muted"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

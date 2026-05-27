@@ -69,10 +69,11 @@ class CodexCLI:
         model: str | None = None,
         reasoning_effort: str | None = None,
     ) -> CodexRunResult:
-        prompt_path = session.write_text(f"{label}/prompt.md", prompt)
-        stdout_path = session.path(f"{label}/stdout.jsonl")
-        stderr_path = session.path(f"{label}/stderr.txt")
-        last_message_path = session.path(f"{label}/last-message.md")
+        path_label = _safe_label(label)
+        prompt_path = session.write_text(f"{path_label}/prompt.md", prompt)
+        stdout_path = session.path(f"{path_label}/stdout.jsonl")
+        stderr_path = session.path(f"{path_label}/stderr.txt")
+        last_message_path = session.path(f"{path_label}/last-message.md")
 
         executable = self.resolve_executable()
         command = [
@@ -119,7 +120,7 @@ class CodexCLI:
 
         if dry_run:
             session.write_json(
-                f"{label}/dry-run-command.json",
+                f"{path_label}/dry-run-command.json",
                 {
                     "command": _redacted_command(command),
                     "workdir": str(workdir),
@@ -204,6 +205,11 @@ def _redacted_env(values: dict[str, str]) -> dict[str, str]:
         else:
             result[key] = value
     return result
+
+
+def _safe_label(value: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in value)
+    return safe.strip("-") or "codex-run"
 
 
 def _redacted_command(command: list[str]) -> list[str]:

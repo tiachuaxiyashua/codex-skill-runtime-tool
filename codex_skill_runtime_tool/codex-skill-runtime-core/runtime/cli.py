@@ -46,6 +46,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--qa", choices=["auto", "off", "required"], default="auto", help="Required QA gate mode.")
     parser.add_argument("--godot", default=None, help="Godot executable or directory.")
     parser.add_argument("--strict-tools", action="store_true", help="Run slash commands through runtime-owned structured tool actions.")
+    parser.add_argument("--strict-schema", dest="strict_schema", action="store_true", default=True, help="Use Codex --output-schema for strict action-loop steps. Default: on.")
+    parser.add_argument("--no-strict-schema", dest="strict_schema", action="store_false", help="Use prompt-only raw JSON for strict action-loop steps.")
     parser.add_argument("--max-steps", type=int, default=8, help="Maximum strict action-loop steps.")
     parser.add_argument("--add-dir", action="append", default=[], help="Additional directory to expose for skill/config discovery and Codex execution.")
     parser.add_argument("--output-style", default=None, help="Claude Code compatible output style hint for prompt construction.")

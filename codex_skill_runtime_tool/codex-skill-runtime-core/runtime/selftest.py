@@ -70,8 +70,8 @@ class SelfTester:
         self.codex_executable = codex_executable
         self.model = model
         self.godot = godot
-        self.godot_project = godot_project
-        self.live_qa_target = live_qa_target
+        self.godot_project = godot_project.expanduser().resolve() if godot_project is not None else None
+        self.live_qa_target = live_qa_target.expanduser().resolve() if live_qa_target is not None else None
         self.live_strict_target = live_strict_target
         self.results: list[Check] = []
 

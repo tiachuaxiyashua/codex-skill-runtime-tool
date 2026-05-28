@@ -298,6 +298,8 @@ class RuntimeSession:
             return "waiting_user"
         if active_nodes:
             return "running"
+        if self._status in {"done", "failed", "blocked", "cancelled"}:
+            return self._status
         terminal = [node for node in self._nodes.values() if node.get("status") in {"failed", "blocked"}]
         if terminal:
             return str(terminal[-1].get("status"))

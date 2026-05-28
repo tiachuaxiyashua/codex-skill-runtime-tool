@@ -83,6 +83,7 @@ class SelfTester:
             self._codex_dry_run_contract,
             self._strict_dry_run_contract,
             self._tool_executor_contract,
+            self._session_terminal_status_contract,
             self._permission_contract,
             self._command_preprocessing_contract,
             self._plugin_manifest_contract,
@@ -276,6 +277,19 @@ class SelfTester:
         self._assert(question.status == "OK" and question.data.get("answer") == "yes", "assume-yes question failed")
         bash = executor.execute({"tool": "bash", "reason": "test bash", "parameters": {"command": "python -c \"print('SELFTEST_BASH_OK')\"", "timeout": 30}})
         self._assert(bash.status == "OK" and "SELFTEST_BASH_OK" in bash.data.get("stdout", ""), "bash tool failed")
+        return f"session={session.id}"
+
+    def _session_terminal_status_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-session-terminal-status")
+        skill = session.start_node("skill", "selftest:status")
+        agent = session.start_node("agent", "selftest-agent", parent_id=skill)
+        failed_probe = session.start_node("tool", "read_file", parent_id=agent)
+        session.finish_node(failed_probe, status="failed")
+        session.finish_node(agent, status="done")
+        session.finish_node(skill, status="done")
+        session.set_status("done")
+        state = json.loads(session.path("session-state.json").read_text(encoding="utf-8"))
+        self._assert(state.get("status") == "done", "terminal session status must not be poisoned by earlier failed probe tools")
         return f"session={session.id}"
 
     def _permission_contract(self) -> str:

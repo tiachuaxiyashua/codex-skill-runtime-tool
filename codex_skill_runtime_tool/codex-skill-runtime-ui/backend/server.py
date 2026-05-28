@@ -217,7 +217,9 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
             max_steps = payload.get("max_steps")
             if max_steps not in {None, ""}:
                 command.extend(["--max-steps", str(int(max_steps))])
-            if bool(payload.get("strict_tools")):
+            if "strict_tools" in payload and not bool(payload.get("strict_tools")):
+                command.append("--no-strict-tools")
+            elif bool(payload.get("strict_tools")):
                 command.append("--strict-tools")
             command.extend(["run", invocation])
             if arguments:

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import glob as glob_module
+import fnmatch
 import json
 import re
 import shlex
@@ -13,8 +14,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .bridge import LocalBridge
+from .capabilities import discover_capabilities
 from .compat import model_invocable
-from .hooks import HookDispatcher, hook_block_reason, hook_updated_input
+from .hooks import HookDispatcher, PermissionDecision, hook_block_reason, hook_updated_input
 from .ide import IDESelection, ide_context, run_lsp_command, write_ide_diagnostics, write_ide_selection
 from .large_results import compact_tool_result
 from .loaders import SkillRepositoryLoader
@@ -110,6 +112,7 @@ class ToolExecutor:
             "project_memory_read": self._project_memory_read,
             "project_memory_write": self._project_memory_write,
             "asset_register": self._asset_register,
+            "capability_list": self._capability_list,
             "web_fetch": self._web_fetch,
             "web_search": self._web_search,
             "mcp": self._mcp,
@@ -210,6 +213,19 @@ class ToolExecutor:
             result = handler(parameters)
         except Exception as exc:
             result = ToolResult(tool=tool, status="ERROR", summary=str(exc), data={})
+        if result.status == "ERROR":
+            failure_results = self._fire_post_tool_failure_hooks(tool, parameters, result)
+            block_reason = hook_block_reason(failure_results, assume_yes=self.assume_yes)
+            if block_reason is not None:
+                return ToolResult(
+                    tool=tool,
+                    status="BLOCKED",
+                    summary=block_reason,
+                    data={
+                        "tool_result": asdict(result),
+                        "hook_results": [asdict(item) for item in failure_results],
+                    },
+                )
         post_results = self._fire_post_tool_hooks(tool, parameters, result)
         block_reason = hook_block_reason(post_results, assume_yes=self.assume_yes)
         if block_reason is None:
@@ -455,6 +471,14 @@ class ToolExecutor:
             str(path.relative_to(document.path.parent))
             for path in loader.skill_support_files(document, limit=80)
         ]
+        loaded_name = str(document.metadata.get("name") or document.path.parent.name)
+        self.session.record_invoked_skill(
+            name=loaded_name,
+            path=document.path,
+            content=rendered_body,
+            agent=self.agent_name,
+            metadata=document.metadata,
+        )
         if str(document.metadata.get("context", "")).strip() == "fork":
             if self.task_runner is None:
                 raise ToolExecutionError(f"forked skill {name} requires a task runner")
@@ -539,6 +563,18 @@ class ToolExecutor:
             "OK",
             "Registered asset in runtime project memory",
             {"path": str(path), "asset": asset},
+        )
+
+    def _capability_list(self, parameters: dict[str, Any]) -> ToolResult:
+        capabilities = [item.to_dict() for item in discover_capabilities(self.project_root, additional_dirs=self.additional_dirs)]
+        namespace = str(parameters.get("namespace") or "").strip()
+        if namespace:
+            capabilities = [item for item in capabilities if str(item.get("namespace") or "") == namespace]
+        return ToolResult(
+            "capability_list",
+            "OK",
+            f"Listed {len(capabilities)} runtime capabilities",
+            {"capabilities": capabilities},
         )
 
     def _web_fetch(self, parameters: dict[str, Any]) -> ToolResult:
@@ -776,6 +812,11 @@ class ToolExecutor:
         return path
 
     def _permission_decision(self, tool: str, parameters: dict[str, Any]):
+        if self.preapproved_tools and not _allowed_by_frontmatter(tool, parameters, self.preapproved_tools):
+            claude_tool = _CLAUDE_TOOL_NAMES.get(tool, tool)
+            if self.assume_yes:
+                return PermissionDecision("ALLOW", f"assume-yes approved tool outside allowed-tools: {claude_tool}", None)
+            return PermissionDecision("ASK", f"tool not preapproved by allowed-tools: {claude_tool}", None)
         return self.hooks.permission_decision(
             _CLAUDE_TOOL_NAMES.get(tool, tool),
             _claude_permission_parameters(tool, parameters),
@@ -805,6 +846,21 @@ class ToolExecutor:
                 "tool_name": tool_name,
                 "tool_input": _claude_tool_input(tool, parameters),
                 "tool_result": result.summary,
+                "tool_response": asdict(result),
+            },
+            session=self.session,
+        )
+
+    def _fire_post_tool_failure_hooks(self, tool: str, parameters: dict[str, Any], result: ToolResult):
+        tool_name = _CLAUDE_TOOL_NAMES.get(tool, tool)
+        return self.hooks.fire(
+            "PostToolUseFailure",
+            matcher_value=tool_name,
+            payload={
+                "tool": tool_name,
+                "tool_name": tool_name,
+                "tool_input": _claude_tool_input(tool, parameters),
+                "error": result.summary,
                 "tool_response": asdict(result),
             },
             session=self.session,
@@ -856,6 +912,9 @@ _TOOL_ALIASES = {
     "ProjectMemoryWrite": "project_memory_write",
     "asset_register": "asset_register",
     "AssetRegister": "asset_register",
+    "capability_list": "capability_list",
+    "CapabilityList": "capability_list",
+    "capabilities": "capability_list",
     "webfetch": "web_fetch",
     "web_fetch": "web_fetch",
     "WebFetch": "web_fetch",
@@ -898,6 +957,7 @@ _CLAUDE_TOOL_NAMES = {
     "project_memory_read": "Read",
     "project_memory_write": "Write",
     "asset_register": "Write",
+    "capability_list": "Read",
     "web_fetch": "WebFetch",
     "web_search": "WebSearch",
     "mcp": "mcp",
@@ -934,6 +994,35 @@ def _split_allowed_tool_string(value: str) -> list[str]:
     if "," in value:
         return [part.strip() for part in value.split(",")]
     return [part.strip() for part in value.split()]
+
+
+def _allowed_by_frontmatter(tool: str, parameters: dict[str, Any], allowed: set[str]) -> bool:
+    claude_tool = _CLAUDE_TOOL_NAMES.get(tool, tool)
+    candidates = {
+        tool,
+        claude_tool,
+        claude_tool.lower(),
+        tool.replace("_", "-"),
+    }
+    mcp_tool = str(parameters.get("tool") or "")
+    if tool == "mcp" and mcp_tool:
+        candidates.add(mcp_tool)
+    command = str(parameters.get("command") or "")
+    for raw in allowed:
+        token = raw.strip()
+        if not token:
+            continue
+        if token in candidates:
+            return True
+        if token.endswith("*") and any(fnmatch.fnmatch(candidate, token) for candidate in candidates):
+            return True
+        if token.startswith("Bash(") and token.endswith(")") and tool == "bash":
+            pattern = token.removeprefix("Bash(").removesuffix(")")
+            if fnmatch.fnmatch(command, pattern):
+                return True
+        if token.startswith("mcp__") and tool == "mcp" and mcp_tool and fnmatch.fnmatch(mcp_tool, token):
+            return True
+    return False
 
 
 def _expand_plugin_root(value: str, plugin_root: Path | None) -> str:

@@ -18,8 +18,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 TOOL_ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = TOOL_ROOT.parent
 CORE_CLI = TOOL_ROOT / "codex-skill-runtime-core" / "core_cli.py"
+CORE_ROOT = TOOL_ROOT / "codex-skill-runtime-core"
 STATIC_ROOT = Path(__file__).resolve().parents[1] / "frontend"
 DEFAULT_ENV = TOOL_ROOT / "config" / "skill-runtime.env"
+
+sys.path.insert(0, str(CORE_ROOT))
+
+from runtime.capabilities import discover_capabilities  # noqa: E402
+from runtime.jobs import JobRegistry  # noqa: E402
+from runtime.plugins import set_plugin_enabled  # noqa: E402
 
 
 class ServerState:
@@ -27,6 +34,7 @@ class ServerState:
         self.runtime_env = runtime_env
         self.state_root = state_root
         self.processes: dict[str, dict[str, object]] = {}
+        self.jobs = JobRegistry(state_root)
         self.lock = threading.Lock()
 
     @property
@@ -55,6 +63,12 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
             return self._json(self._session_detail(session_id))
         if parsed.path == "/api/skills":
             return self._json(self._skills())
+        if parsed.path == "/api/capabilities":
+            return self._json(self._capabilities())
+        if parsed.path == "/api/jobs":
+            return self._json({"jobs": self._jobs()})
+        if parsed.path == "/api/plugins":
+            return self._json(self._plugins())
         if parsed.path == "/api/file":
             query = parse_qs(parsed.query)
             return self._serve_file(query.get("path", [""])[0])
@@ -70,6 +84,11 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
                 return self._json(self._start_runtime(payload, "resume"))
             if parsed.path == "/api/answer":
                 return self._json(self._start_runtime(payload, "answer"))
+            if parsed.path == "/api/plugin":
+                return self._json(self._set_plugin(payload))
+            if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/cancel"):
+                job_id = unquote(parsed.path.removeprefix("/api/jobs/").removesuffix("/cancel").strip("/"))
+                return self._json(self._cancel_job(job_id))
         except Exception as exc:
             return self._json({"ok": False, "error": str(exc)}, status=500)
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -91,7 +110,14 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
         if not raw_path:
             return self._json({"ok": False, "error": "path is required"}, status=400)
         path = Path(raw_path).expanduser().resolve()
-        allowed_roots = [WORKSPACE_ROOT.resolve(), self.state.state_root.resolve()]
+        env_paths = _runtime_env_paths(self.state.runtime_env)
+        allowed_roots = [
+            WORKSPACE_ROOT.resolve(),
+            TOOL_ROOT.resolve(),
+            self.state.state_root.resolve(),
+            env_paths["target_workspace"],
+            *env_paths["skill_repos"],
+        ]
         if not any(_is_under(path, root) for root in allowed_roots):
             return self._json({"ok": False, "error": "path is outside the workspace"}, status=403)
         if not path.exists() or path.is_dir():
@@ -124,18 +150,23 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
 
     def _health(self) -> dict[str, object]:
         config = _load_env(self.state.runtime_env)
+        _apply_runtime_env_to_process(config)
+        paths = _runtime_env_paths(self.state.runtime_env)
+        capabilities = discover_capabilities(paths["target_workspace"], additional_dirs=paths["skill_repos"])
         return {
             "ok": True,
             "workspace_root": str(WORKSPACE_ROOT),
+            "target_workspace": str(paths["target_workspace"]),
+            "skill_repos": [str(path) for path in paths["skill_repos"]],
             "tool_root": str(TOOL_ROOT),
             "runtime_env": str(self.state.runtime_env),
             "state_root": str(self.state.state_root),
             "core_cli": str(CORE_CLI),
             "codex_api_key_file": _expand_env_value(config.get("CODEX_API_KEY_FILE", "")),
             "codex_base_url": config.get("CODEX_BASE_URL", ""),
-            "forge_base_url": config.get("SKILL_RUNTIME_ENV_FORGE_BASE_URL", ""),
-            "comfyui_base_url": config.get("SKILL_RUNTIME_ENV_COMFYUI_BASE_URL", ""),
+            "capabilities": len(capabilities),
             "processes": self._process_snapshot(),
+            "jobs": self._jobs(),
         }
 
     def _skills(self) -> dict[str, object]:
@@ -155,6 +186,20 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
         except ValueError:
             return {"ok": False, "stdout": completed.stdout[-4000:]}
         return {"ok": True, **data}
+
+    def _capabilities(self) -> dict[str, object]:
+        _apply_runtime_env_to_process(_load_env(self.state.runtime_env))
+        paths = _runtime_env_paths(self.state.runtime_env)
+        return {
+            "ok": True,
+            "capabilities": [item.to_dict() for item in discover_capabilities(paths["target_workspace"], additional_dirs=paths["skill_repos"])],
+        }
+
+    def _plugins(self) -> dict[str, object]:
+        data = self._skills()
+        if not data.get("ok"):
+            return data
+        return {"ok": True, "plugins": data.get("plugins", [])}
 
     def _sessions(self) -> list[dict[str, object]]:
         sessions_root = self.state.sessions_root
@@ -204,6 +249,9 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
             "--runtime-env",
             str(self.state.runtime_env),
         ]
+        target_workspace = str(payload.get("target_workspace") or "").strip()
+        if target_workspace:
+            command.extend(["--target-workspace", target_workspace])
         if operation == "run":
             invocation = str(payload.get("invocation") or payload.get("command") or "").strip()
             arguments = str(payload.get("arguments") or "")
@@ -245,6 +293,14 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
         stdout = self.state.state_root / "ui-processes" / f"{process_id}.stdout.txt"
         stderr = self.state.state_root / "ui-processes" / f"{process_id}.stderr.txt"
         stdout.parent.mkdir(parents=True, exist_ok=True)
+        job = self.state.jobs.create(
+            operation=operation,
+            command=command,
+            cwd=WORKSPACE_ROOT,
+            stdout=stdout,
+            stderr=stderr,
+            metadata={"target_workspace": target_workspace},
+        )
         out_handle = stdout.open("wb")
         err_handle = stderr.open("wb")
         process = subprocess.Popen(
@@ -256,7 +312,7 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
         out_handle.close()
         err_handle.close()
         with self.state.lock:
-            self.state.processes[process_id] = {
+            self.state.processes[job.id] = {
                 "pid": process.pid,
                 "operation": operation,
                 "command": command,
@@ -265,7 +321,8 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
                 "stderr": str(stderr),
                 "process": process,
             }
-        return {"ok": True, "process_id": process_id, "pid": process.pid, "stdout": str(stdout), "stderr": str(stderr)}
+        self.state.jobs.mark_started(job.id, pid=process.pid)
+        return {"ok": True, "process_id": job.id, "job_id": job.id, "pid": process.pid, "stdout": str(stdout), "stderr": str(stderr)}
 
     def _process_snapshot(self) -> list[dict[str, object]]:
         rows = []
@@ -273,6 +330,8 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
             for process_id, data in list(self.state.processes.items()):
                 process = data.get("process")
                 returncode = process.poll() if isinstance(process, subprocess.Popen) else None
+                if returncode is not None:
+                    self.state.jobs.mark_finished(process_id, returncode=returncode)
                 rows.append(
                     {
                         "id": process_id,
@@ -285,6 +344,32 @@ class RuntimeUIHandler(BaseHTTPRequestHandler):
                     }
                 )
         return rows
+
+    def _jobs(self) -> list[dict[str, object]]:
+        self._process_snapshot()
+        jobs = self.state.jobs.list(limit=300)
+        for item in jobs:
+            if item.get("status") in {"starting", "running", "cancel_requested"} and item.get("id") not in self.state.processes:
+                self.state.jobs.mark_unknown_if_orphaned(str(item.get("id")))
+        return self.state.jobs.list(limit=300)
+
+    def _cancel_job(self, job_id: str) -> dict[str, object]:
+        with self.state.lock:
+            data = self.state.processes.get(job_id)
+            process = data.get("process") if isinstance(data, dict) else None
+            if isinstance(process, subprocess.Popen) and process.poll() is None:
+                process.terminate()
+        return self.state.jobs.cancel(job_id)
+
+    def _set_plugin(self, payload: dict[str, object]) -> dict[str, object]:
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise ValueError("plugin name is required")
+        enabled = bool(payload.get("enabled"))
+        root = str(payload.get("root") or "").strip() or None
+        paths = _runtime_env_paths(self.state.runtime_env)
+        state = set_plugin_enabled(paths["target_workspace"], name=name, root=root, enabled=enabled)
+        return {"ok": True, "state": state}
 
 
 def _session_status(state: object, summary: object, session_dir: Path) -> str:
@@ -440,6 +525,16 @@ def _load_env(path: Path) -> dict[str, str]:
     return values
 
 
+def _apply_runtime_env_to_process(values: dict[str, str]) -> None:
+    for key, value in values.items():
+        if key.startswith("SKILL_RUNTIME_ENV_") and len(key) > len("SKILL_RUNTIME_ENV_"):
+            os.environ[key.removeprefix("SKILL_RUNTIME_ENV_")] = value
+        elif key in {"SKILL_RUNTIME_CAPABILITIES_JSON", "CODEX_SKILL_RUNTIME_CAPABILITIES_JSON"}:
+            os.environ[key] = value
+        elif key.startswith("SKILL_RUNTIME_CAPABILITY_") or key.startswith("CODEX_SKILL_RUNTIME_CAPABILITY_"):
+            os.environ[key] = value
+
+
 def _expand_env_value(value: str, current: dict[str, str] | None = None) -> str:
     values = {
         "SKILL_RUNTIME_TOOL_ROOT": str(TOOL_ROOT),
@@ -459,6 +554,19 @@ def _state_root_from_env(runtime_env: Path) -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return TOOL_ROOT / ".skill-runtime" / "state"
+
+
+def _runtime_env_paths(runtime_env: Path) -> dict[str, object]:
+    values = _load_env(runtime_env)
+    root = Path(values.get("SKILL_RUNTIME_ROOT") or WORKSPACE_ROOT).expanduser().resolve()
+    target = Path(values.get("SKILL_RUNTIME_TARGET_WORKSPACE") or values.get("SKILL_RUNTIME_WORKSPACE") or root).expanduser().resolve()
+    raw_repos = values.get("SKILL_RUNTIME_SKILL_REPOS") or values.get("SKILL_RUNTIME_SKILL_REPOSITORIES") or ""
+    if raw_repos:
+        repos = [Path(item).expanduser().resolve() for item in _split_list(raw_repos)]
+    else:
+        repos = [root]
+    add_dirs = [Path(item).expanduser().resolve() for item in _split_list(values.get("SKILL_RUNTIME_ADD_DIRS") or values.get("SKILL_RUNTIME_ADD_DIR") or "")]
+    return {"root": root, "target_workspace": target, "skill_repos": _unique_paths([*repos, *add_dirs])}
 
 
 def _artifact_type(path: Path) -> str:
@@ -491,6 +599,31 @@ def _first_text(*values: object) -> str:
         if text:
             return text
     return ""
+
+
+def _split_list(value: str) -> list[str]:
+    stripped = str(value or "").strip()
+    if not stripped:
+        return []
+    if stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            return []
+        return [str(item).strip() for item in parsed if str(item).strip()] if isinstance(parsed, list) else []
+    separator = "||" if "||" in stripped else ";"
+    return [item.strip() for item in stripped.split(separator) if item.strip()]
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in paths:
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(resolved)
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:

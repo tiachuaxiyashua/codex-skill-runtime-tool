@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .bridge import LocalBridge, bridge_context
+from .capabilities import discover_capabilities
 from .codex_cli import CodexCLI
 from .frontmatter import MarkdownDocument
 from .gates import evaluate_qa_report
@@ -25,6 +26,8 @@ from .memory import project_memory_context, record_session_summary, runtime_memo
 from .mcp import discover_mcp_servers, mcp_instructions_context
 from .mcp_oauth import complete_oauth_authorization, start_oauth_authorization, stored_oauth_headers, token_record_from_auth_output
 from .microcompact import TIME_BASED_MC_CLEARED_MESSAGE, compact_observations
+from .jobs import JobRegistry
+from .plugins import set_plugin_enabled
 from .prompts import skill_prompt
 from .questions import answer_pending_question, load_pending_question, pending_question_context
 from .runtime import CodexSkillRuntime
@@ -88,6 +91,7 @@ class SelfTester:
             self._command_preprocessing_contract,
             self._plugin_manifest_contract,
             self._skill_registry_contract,
+            self._generic_platform_contract,
             self._question_pause_contract,
             self._project_memory_contract,
             self._godot_plugin_contract,
@@ -451,6 +455,99 @@ class SelfTester:
             else:
                 os.environ["SKILL_RUNTIME_NAMESPACES"] = old
         return f"session={session.id}"
+
+    def _generic_platform_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-generic-platform")
+        target = session.path("target-workspace")
+        skill_repo = session.path("skill-repo")
+        plugin_root = skill_repo / "generic-plugin"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "README.md").write_text("TARGET_WORKSPACE", encoding="utf-8")
+        (skill_repo / "skills" / "path-skill").mkdir(parents=True, exist_ok=True)
+        (skill_repo / "skills" / "path-skill" / "SKILL.md").write_text(
+            "---\nname: path-skill\ndescription: Path-filtered generic skill.\npaths: src/**\n---\nPath skill body.",
+            encoding="utf-8",
+        )
+        (plugin_root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+        (plugin_root / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps(
+                {
+                    "name": "generic",
+                    "skills": "skills",
+                    "capabilities": [
+                        {
+                            "name": "local-renderer",
+                            "kind": "test-service",
+                            "endpoint": "http://127.0.0.1:1",
+                            "description": "fixture capability",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (plugin_root / "skills" / "plugin-skill").mkdir(parents=True, exist_ok=True)
+        (plugin_root / "skills" / "plugin-skill" / "SKILL.md").write_text(
+            "---\nname: plugin-skill\ndescription: Generic plugin skill.\n---\nPlugin skill body.",
+            encoding="utf-8",
+        )
+        (skill_repo / ".codex-skill-runtime").mkdir(parents=True, exist_ok=True)
+        (skill_repo / ".codex-skill-runtime" / "capabilities.json").write_text(
+            json.dumps({"capabilities": [{"name": "fixture-api", "kind": "http", "endpoint": "http://127.0.0.1:2"}]}),
+            encoding="utf-8",
+        )
+
+        old_namespace = os.environ.get("SKILL_RUNTIME_NAMESPACES")
+        os.environ["SKILL_RUNTIME_NAMESPACES"] = f"bench={skill_repo}"
+        try:
+            loader = SkillRepositoryLoader(target, additional_dirs=[skill_repo], bare=True)
+            skills = loader.list_skills()
+            self._assert("bench:path-skill" in skills, "skill repo was not discovered separately from target workspace")
+            self._assert("generic:plugin-skill" in skills, "plugin skill was not discovered through additional skill repo")
+            visible = loader.skill_listings(touched_paths=["src/main.py"], model_only=True)
+            hidden = loader.skill_listings(touched_paths=["docs/readme.md"], model_only=True)
+            self._assert(any(item.name == "bench:path-skill" for item in visible), "paths frontmatter did not expose matching skill")
+            self._assert(not any(item.name == "bench:path-skill" for item in hidden), "paths frontmatter exposed non-matching skill")
+
+            capabilities = discover_capabilities(target, additional_dirs=[skill_repo])
+            names = {item.name for item in capabilities}
+            self._assert({"fixture-api", "local-renderer"}.issubset(names), "capability registry missed file or plugin manifest capabilities")
+
+            set_plugin_enabled(target, name="generic", root=plugin_root, enabled=False)
+            disabled_loader = SkillRepositoryLoader(target, additional_dirs=[skill_repo], bare=True)
+            self._assert("generic:plugin-skill" not in disabled_loader.list_skills(), "disabled plugin still exposed skills")
+            set_plugin_enabled(target, name="generic", root=plugin_root, enabled=True)
+            enabled_loader = SkillRepositoryLoader(target, additional_dirs=[skill_repo], bare=True)
+            self._assert("generic:plugin-skill" in enabled_loader.list_skills(), "re-enabled plugin did not expose skills")
+
+            executor = ToolExecutor(
+                project_root=target,
+                hooks=HookDispatcher([], target),
+                session=session,
+                assume_yes=False,
+                additional_dirs=[skill_repo],
+                allowed_tools=["Read", "Skill"],
+            )
+            read = executor.execute({"tool": "read_file", "parameters": {"path": "README.md"}})
+            self._assert(read.status == "OK", "read inside target workspace failed")
+            blocked_write = executor.execute({"tool": "write_file", "parameters": {"path": "blocked.txt", "content": "x"}})
+            self._assert(blocked_write.status == "BLOCKED", "allowed-tools did not pause non-preapproved write")
+            loaded = executor.execute({"tool": "skill", "parameters": {"name": "bench:path-skill", "allow_disabled": True}})
+            self._assert(loaded.status == "OK", "nested skill action failed against separated skill repo")
+            self._assert((session.dir / "invoked-skills.json").exists(), "invoked skill was not preserved in session state")
+
+            jobs = JobRegistry(session.path("job-state"))
+            job = jobs.create(operation="selftest", command=["python", "-V"], cwd=target, stdout=session.path("job.out"), stderr=session.path("job.err"))
+            jobs.mark_started(job.id, pid=1)
+            jobs.mark_finished(job.id, returncode=0)
+            stored = jobs.get(job.id)
+            self._assert(stored and stored.get("status") == "done", "persistent job lifecycle did not reach done")
+        finally:
+            if old_namespace is None:
+                os.environ.pop("SKILL_RUNTIME_NAMESPACES", None)
+            else:
+                os.environ["SKILL_RUNTIME_NAMESPACES"] = old_namespace
+        return f"target={target} skill_repo={skill_repo}"
 
     def _question_pause_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-question-pause")

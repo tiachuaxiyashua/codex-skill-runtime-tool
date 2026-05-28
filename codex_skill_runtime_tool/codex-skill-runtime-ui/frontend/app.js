@@ -1,6 +1,10 @@
 const state = {
   sessions: [],
   skills: [],
+  skillListings: [],
+  capabilities: [],
+  jobs: [],
+  plugins: [],
   selectedSession: null,
   detail: null,
   selectedNodeId: null,
@@ -28,16 +32,20 @@ function fileUrl(path) {
 
 async function loadHealth() {
   const data = await api("/api/health");
-  const running = (data.processes || []).filter((item) => item.returncode === null).length;
+  const running = (data.jobs || []).filter((item) => ["starting", "running", "cancel_requested"].includes(item.status)).length;
+  if (!$("target-workspace").value && data.target_workspace) $("target-workspace").placeholder = data.target_workspace;
   const chips = [
+    ["target", data.target_workspace],
     ["env", data.runtime_env],
-    ["state", data.state_root],
     ["api", data.codex_base_url || "未配置"],
+    ["cap", String(data.capabilities || 0)],
     ["running", String(running)],
   ];
   $("health-strip").innerHTML = chips
     .map(([name, value]) => `<span class="health-chip">${name}: ${escapeHtml(shortPath(value))}</span>`)
     .join("");
+  state.jobs = data.jobs || [];
+  renderJobs();
 }
 
 async function loadSkills() {
@@ -48,7 +56,22 @@ async function loadSkills() {
     return;
   }
   state.skills = Array.isArray(data.skills) ? data.skills : [];
+  state.skillListings = Array.isArray(data.skill_listings) ? data.skill_listings : [];
+  state.plugins = Array.isArray(data.plugins) ? data.plugins : [];
   renderSkills();
+  renderPlugins();
+}
+
+async function loadCapabilities() {
+  const data = await api("/api/capabilities");
+  state.capabilities = data.capabilities || [];
+  renderCapabilities();
+}
+
+async function loadJobs() {
+  const data = await api("/api/jobs");
+  state.jobs = data.jobs || [];
+  renderJobs();
 }
 
 function renderSkills() {
@@ -60,7 +83,11 @@ function renderSkills() {
     visible.map((skill) => `<option value="/${escapeAttr(skill)}">/${escapeHtml(skill)}</option>`).join("");
   $("skill-list").innerHTML =
     visible
-      .map((skill) => `<button class="skill-chip" data-command="/${escapeAttr(skill)}">/${escapeHtml(skill)}</button>`)
+      .map((skill) => {
+        const listing = state.skillListings.find((item) => item.name === skill) || {};
+        const description = listing.description ? `<span>${escapeHtml(listing.description)}</span>` : "";
+        return `<button class="skill-chip" data-command="/${escapeAttr(skill)}"><strong>/${escapeHtml(skill)}</strong>${description}</button>`;
+      })
       .join("") || `<div class="empty">没有匹配的 skill</div>`;
   document.querySelectorAll(".skill-chip").forEach((item) => {
     item.addEventListener("click", () => {
@@ -192,7 +219,7 @@ function treeNodeHtml(node, depth) {
     <div class="tree-node ${selected}" data-node-id="${escapeAttr(node.id)}" style="--depth:${depth * 14}px">
       <div class="tree-line">
         <span class="pill ${statusClass(node.status)}">${escapeHtml(node.status || "unknown")}</span>
-        <span class="node-name">${escapeHtml(type)} · ${escapeHtml(display)}</span>
+        <span class="node-name">${escapeHtml(type)} / ${escapeHtml(display)}</span>
       </div>
     </div>`;
 }
@@ -234,7 +261,7 @@ function renderTimeline(events) {
         return `
           <div class="timeline-item ${newClass}">
             <div><strong>${escapeHtml(event.message || "")}</strong></div>
-            <div class="event-type">${escapeHtml(event.timestamp || "")} · ${escapeHtml(event.type || "")}${escapeHtml(suffix)}</div>
+            <div class="event-type">${escapeHtml(event.timestamp || "")} / ${escapeHtml(event.type || "")}${escapeHtml(suffix)}</div>
           </div>`;
       })
       .join("") || `<div class="empty">暂无事件</div>`;
@@ -268,7 +295,7 @@ function artifactHtml(item) {
 function renderFiles(files) {
   $("files").innerHTML =
     files
-      .map((file) => `<div class="file-row" data-path="${escapeAttr(file.path)}">${escapeHtml(file.relative)} · ${file.bytes} bytes</div>`)
+      .map((file) => `<div class="file-row" data-path="${escapeAttr(file.path)}">${escapeHtml(file.relative)} / ${file.bytes} bytes</div>`)
       .join("") || `<div class="empty">暂无证据文件</div>`;
   document.querySelectorAll(".file-row").forEach((row) => {
     row.addEventListener("click", () => previewFile(row.dataset.path));
@@ -304,6 +331,54 @@ function evidenceLinks(evidence) {
   return links ? `<div>${links}</div>` : "";
 }
 
+function renderCapabilities() {
+  $("capabilities").innerHTML =
+    state.capabilities
+      .map((item) => `
+        <div class="mini-row">
+          <strong>${escapeHtml(item.name)}</strong>
+          <span>${escapeHtml(item.status || "")}</span>
+          <div class="tiny-muted">${escapeHtml(shortPath(item.endpoint || item.source || ""))}</div>
+        </div>`)
+      .join("") || `<div class="empty">暂无 capability</div>`;
+}
+
+function renderJobs() {
+  $("jobs").innerHTML =
+    state.jobs
+      .slice(0, 20)
+      .map((job) => {
+        const canCancel = ["starting", "running", "cancel_requested"].includes(job.status);
+        return `
+          <div class="mini-row">
+            <strong>${escapeHtml(job.operation || job.id)}</strong>
+            <span class="pill ${statusClass(job.status)}">${escapeHtml(job.status || "")}</span>
+            <div class="tiny-muted">${escapeHtml(job.started_at || "")} pid=${escapeHtml(job.pid || "")}</div>
+            ${canCancel ? `<button class="ghost cancel-job" data-job="${escapeAttr(job.id)}">停止</button>` : ""}
+          </div>`;
+      })
+      .join("") || `<div class="empty">暂无 job</div>`;
+  document.querySelectorAll(".cancel-job").forEach((button) => {
+    button.addEventListener("click", () => cancelJob(button.dataset.job));
+  });
+}
+
+function renderPlugins() {
+  $("plugins").innerHTML =
+    state.plugins
+      .map((plugin) => `
+        <div class="mini-row">
+          <strong>${escapeHtml(plugin.name)}</strong>
+          <span>${plugin.enabled ? "启用" : "停用"}</span>
+          <div class="tiny-muted">${escapeHtml(shortPath(plugin.root || ""))}</div>
+          <button class="ghost plugin-toggle" data-name="${escapeAttr(plugin.name)}" data-root="${escapeAttr(plugin.root || "")}" data-enabled="${plugin.enabled ? "0" : "1"}">${plugin.enabled ? "停用" : "启用"}</button>
+        </div>`)
+      .join("") || `<div class="empty">暂无插件</div>`;
+  document.querySelectorAll(".plugin-toggle").forEach((button) => {
+    button.addEventListener("click", () => togglePlugin(button.dataset.name, button.dataset.root, button.dataset.enabled === "1"));
+  });
+}
+
 async function startRun() {
   const invocation = $("run-command").value.trim();
   const args = $("run-arguments").value;
@@ -316,13 +391,14 @@ async function startRun() {
     body: JSON.stringify({
       invocation,
       arguments: args,
+      target_workspace: $("target-workspace").value.trim(),
       strict_tools: $("strict-tools").checked,
       qa: $("qa-mode").value,
       max_steps: $("max-steps").value,
     }),
   });
-  $("run-result").textContent = result.ok ? `已启动 pid=${result.pid}` : result.error || "启动失败";
-  setTimeout(loadSessions, 1200);
+  $("run-result").textContent = result.ok ? `已启动 job=${result.job_id || result.process_id} pid=${result.pid}` : result.error || "启动失败";
+  setTimeout(tick, 1200);
 }
 
 async function resumeCurrent() {
@@ -330,10 +406,10 @@ async function resumeCurrent() {
   const prompt = $("resume-prompt").value;
   const result = await api("/api/resume", {
     method: "POST",
-    body: JSON.stringify({ session: state.selectedSession, prompt }),
+    body: JSON.stringify({ session: state.selectedSession, prompt, target_workspace: $("target-workspace").value.trim() }),
   });
-  $("resume-result").textContent = result.ok ? `已启动 resume pid=${result.pid}` : result.error || "resume 失败";
-  setTimeout(loadSessions, 1200);
+  $("resume-result").textContent = result.ok ? `已启动 resume job=${result.job_id || result.process_id}` : result.error || "resume 失败";
+  setTimeout(tick, 1200);
 }
 
 async function answerCurrent() {
@@ -342,10 +418,24 @@ async function answerCurrent() {
   if (!answer) return;
   const result = await api("/api/answer", {
     method: "POST",
-    body: JSON.stringify({ session: state.selectedSession, answer }),
+    body: JSON.stringify({ session: state.selectedSession, answer, target_workspace: $("target-workspace").value.trim() }),
   });
-  $("resume-result").textContent = result.ok ? `已提交 answer pid=${result.pid}` : result.error || "answer 失败";
-  setTimeout(loadSessions, 1200);
+  $("resume-result").textContent = result.ok ? `已提交 answer job=${result.job_id || result.process_id}` : result.error || "answer 失败";
+  setTimeout(tick, 1200);
+}
+
+async function cancelJob(jobId) {
+  if (!jobId) return;
+  await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST", body: "{}" });
+  await loadJobs();
+}
+
+async function togglePlugin(name, root, enabled) {
+  await api("/api/plugin", {
+    method: "POST",
+    body: JSON.stringify({ name, root, enabled }),
+  });
+  await loadSkills();
 }
 
 function shortPath(value) {
@@ -370,6 +460,7 @@ async function tick() {
   try {
     await loadHealth();
     await loadSessions();
+    await loadJobs();
     if (state.selectedSession) await loadDetail();
   } catch (error) {
     console.error(error);
@@ -387,5 +478,6 @@ $("skill-select").addEventListener("change", () => {
 });
 
 loadSkills().catch(console.error);
+loadCapabilities().catch(console.error);
 tick();
 setInterval(tick, 2500);

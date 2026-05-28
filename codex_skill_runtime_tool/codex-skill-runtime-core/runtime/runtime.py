@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import json
+import fnmatch
+import os
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -8,6 +10,7 @@ from pathlib import Path
 
 from .action_loop import StrictActionLoop
 from .bridge import bridge_context
+from .capabilities import capability_context, discover_capabilities
 from .compat import agent_memory_scope, agent_skill_references, invocation_profile
 from .codex_cli import CodexCLI, CodexRunResult
 from .frontmatter import MarkdownDocument
@@ -81,8 +84,13 @@ class CodexSkillRuntime:
         self.loader.assert_valid()
         return {
             "project_root": str(self.project_root),
+            "target_workspace": str(self.project_root),
+            "skill_repositories": [str(path.resolve()) for path in self.additional_dirs],
             "skills": self.loader.list_skills(),
+            "skill_listings": [item.__dict__ | {"path": str(item.path)} for item in self.loader.skill_listings()],
             "agents": self.loader.list_agents(),
+            "plugins": self.loader.plugin_statuses(),
+            "capabilities": [item.to_dict() for item in discover_capabilities(self.project_root, additional_dirs=self.additional_dirs)],
             "settings": str(self.loader.primary_settings_path()),
             "context_files": [str(path) for path in self.loader.optional_context_files()],
         }
@@ -122,7 +130,7 @@ class CodexSkillRuntime:
 
     def run_skill(self, command: str, arguments: str) -> RuntimeResult:
         clean_command = command[1:] if command.startswith("/") else command
-        session = RuntimeSession(self.project_root, clean_command)
+        session = self._new_session(clean_command)
         skill = self.loader.load_skill(clean_command)
         agent_name, agent = self._load_routed_agent(clean_command, skill)
         hooks = self._hooks_for(skill, agent)
@@ -271,7 +279,7 @@ class CodexSkillRuntime:
 
     def run_strict_skill(self, command: str, arguments: str, max_steps: int = 8) -> RuntimeResult:
         clean_command = command[1:] if command.startswith("/") else command
-        session = RuntimeSession(self.project_root, f"strict-{clean_command}")
+        session = self._new_session(f"strict-{clean_command}")
         skill = self.loader.load_skill(clean_command)
         agent_name, agent = self._load_routed_agent(clean_command, skill)
         hooks = self._hooks_for(skill, agent)
@@ -454,7 +462,7 @@ class CodexSkillRuntime:
         return RuntimeResult(session=session, primary=primary, tasks=tasks, gates=gates, exit_code=exit_code)
 
     def run_agent(self, agent_name: str, prompt_text: str) -> RuntimeResult:
-        session = RuntimeSession(self.project_root, f"agent-{agent_name}")
+        session = self._new_session(f"agent-{agent_name}")
         agent = self.loader.load_agent(agent_name)
         hooks = self._hooks_for(agent=agent)
         profile = invocation_profile(
@@ -545,7 +553,7 @@ class CodexSkillRuntime:
         return RuntimeResult(session=session, primary=result, tasks=[], gates=gates, exit_code=exit_code)
 
     def resume_session(self, session_or_path: str, prompt_text: str = "") -> RuntimeResult:
-        session = RuntimeSession(self.project_root, "resume")
+        session = self._new_session("resume")
         context = replay_context(self.project_root, session_or_path)
         question_context = pending_question_context(self.project_root, session_or_path)
         session.event("session.start", "Starting transcript resume", source=session_or_path)
@@ -595,7 +603,7 @@ class CodexSkillRuntime:
         return self.resume_session(session_or_path, prompt)
 
     def run_strict_smoke(self, read_path: str = "README.md", max_steps: int = 3) -> RuntimeResult:
-        session = RuntimeSession(self.project_root, "strict-smoke")
+        session = self._new_session("strict-smoke")
         session.event("session.start", "Starting strict smoke", read_path=read_path)
         session.set_status("running")
         skill_node = session.start_node(
@@ -927,6 +935,18 @@ class CodexSkillRuntime:
             raw="",
         )
 
+    def _new_session(self, label: str) -> RuntimeSession:
+        return RuntimeSession(
+            self.project_root,
+            label,
+            metadata={
+                "target_workspace": str(self.project_root),
+                "skill_repositories": [str(path.resolve()) for path in self.additional_dirs],
+                "dry_run": self.dry_run,
+                "qa_mode": self.qa_mode,
+            },
+        )
+
     def _run_required_qa(
         self,
         *,
@@ -989,10 +1009,14 @@ class CodexSkillRuntime:
             return False
         if self.qa_mode == "required":
             return True
-        lowered = f"{command} {arguments}".lower()
-        return command in {"prototype", "vertical-slice", "dev-story"} and (
-            "--path engine" in lowered or "godot" in lowered or "engine" in lowered
-        )
+        for pattern in _qa_auto_patterns():
+            if ":" in pattern:
+                command_pattern, argument_pattern = pattern.split(":", 1)
+            else:
+                command_pattern, argument_pattern = pattern, "*"
+            if fnmatch.fnmatch(command, command_pattern) and fnmatch.fnmatch(arguments.lower(), argument_pattern.lower()):
+                return True
+        return False
 
     def _infer_target_path(self, arguments: str, parent_result: str) -> str:
         for token in [*arguments.split(), *parent_result.split()]:
@@ -1078,16 +1102,22 @@ class CodexSkillRuntime:
         context = self.loader.read_context_bundle()
         if context:
             sections.append(context)
+        touched_paths = session.touched_paths()
         for runtime_context in [
             bridge_context(self.project_root),
             voice_context(self.project_root),
             ide_context(self.project_root),
             mcp_instructions_context(self.project_root, additional_dirs=self.additional_dirs),
+            capability_context(self.project_root, additional_dirs=self.additional_dirs),
             project_memory_context(self.project_root),
+            session.invoked_skills_context(max_chars=20000),
         ]:
             if runtime_context:
                 sections.append(runtime_context)
-        skill_registry = self.loader.skill_registry_context()
+        skill_registry = self.loader.skill_registry_context(
+            touched_paths=touched_paths,
+            context_window_tokens=_context_window_tokens(),
+        )
         if skill_registry:
             sections.append(skill_registry)
         memory = runtime_memory_context(self.project_root, exclude_session=session.id)
@@ -1145,6 +1175,23 @@ class CodexSkillRuntime:
 
 def _runtime_schema_path() -> Path:
     return Path(__file__).resolve().parents[1] / "schemas" / "action-result.schema.json"
+
+
+def _context_window_tokens() -> int | None:
+    for key in ("SKILL_RUNTIME_MODEL_CONTEXT_WINDOW", "CODEX_MODEL_CONTEXT_WINDOW", "MODEL_CONTEXT_WINDOW"):
+        value = os.environ.get(key)
+        if not value:
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            continue
+    return None
+
+
+def _qa_auto_patterns() -> list[str]:
+    raw = os.environ.get("SKILL_RUNTIME_QA_AUTO_PATTERNS") or os.environ.get("CODEX_SKILL_RUNTIME_QA_AUTO_PATTERNS") or ""
+    return [item.strip() for item in raw.replace("\n", ";").split(";") if item.strip()]
 
 
 def _node_status_for_gate(gate: GateResult) -> str:

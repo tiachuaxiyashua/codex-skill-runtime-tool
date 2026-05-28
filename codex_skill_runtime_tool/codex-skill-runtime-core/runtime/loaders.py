@@ -7,6 +7,7 @@ from typing import Iterable
 
 from .compat import bundled_skill_documents, matches_paths, model_invocable, user_invocable
 from .frontmatter import MarkdownDocument, read_markdown_document
+from .plugins import is_plugin_enabled, plugin_status_rows
 
 SKILL_BUDGET_CONTEXT_PERCENT = 0.01
 CHARS_PER_TOKEN = 4
@@ -287,16 +288,26 @@ class SkillRepositoryLoader:
         return "\n".join(lines)
 
     def plugin_layouts(self) -> list[PluginLayout]:
+        return self._plugin_layouts(include_disabled=False)
+
+    def all_plugin_layouts(self) -> list[PluginLayout]:
+        return self._plugin_layouts(include_disabled=True)
+
+    def plugin_statuses(self) -> list[dict[str, object]]:
+        return plugin_status_rows(self.layout.root, self.all_plugin_layouts(), include_disabled=True)
+
+    def _plugin_layouts(self, *, include_disabled: bool) -> list[PluginLayout]:
         manifests = []
         for root in self._roots_for_discovery():
             direct = root / ".claude-plugin" / "plugin.json"
             if direct.exists():
                 manifests.append(direct)
-            manifests.extend(
-                path
-                for path in _safe_walk_files(root)
-                if path.name == "plugin.json" and path.parent.name == ".claude-plugin"
-            )
+            if not (self.additional_dirs and root == self.layout.root):
+                manifests.extend(
+                    path
+                    for path in _safe_walk_files(root)
+                    if path.name == "plugin.json" and path.parent.name == ".claude-plugin"
+                )
 
         layouts: list[PluginLayout] = []
         for manifest_path in _unique_existing(manifests):
@@ -308,6 +319,8 @@ class SkillRepositoryLoader:
                 manifest = {}
             root = manifest_path.parent.parent.resolve()
             name = str(manifest.get("name") or root.name)
+            if not include_disabled and not is_plugin_enabled(self.layout.root, name=name, root=root):
+                continue
             layouts.append(PluginLayout(root=root, name=name, manifest_path=manifest_path, manifest=manifest))
         return layouts
 
@@ -337,7 +350,7 @@ class SkillRepositoryLoader:
             candidates.extend(self._children_with_skill(root / ".claude" / "skills"))
         for plugin in self.plugin_layouts():
             candidates.extend(self._plugin_workflow_paths(plugin))
-        if not self.bare and (
+        if not self.bare and not self.additional_dirs and (
             not self.layout.skills_dir.exists()
             and not self.layout.root_skills_dir.exists()
             and not self.layout.commands_dir.exists()

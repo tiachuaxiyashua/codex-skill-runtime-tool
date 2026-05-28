@@ -51,3 +51,13 @@
 - [x] 增加远程 MCP bridge：HTTP streamable JSON-RPC、SSE endpoint/message、WebSocket best-effort、静态 headers、headersHelper、环境变量展开和 401/403 认证边界提示。
 - [x] 增加 session memory/compaction 近似机制：`summary.json`、`.codex-skill-runtime/sessions-index.json`、后续 prompt 的 bounded runtime memory 注入。
 - [x] 新增 selftest：HTTP/SSE MCP bridge、headersHelper 环境变量、memory-compaction-contract；普通 selftest 更新为 18 项。
+- [x] 将 runtime core 与游戏领域解耦：Godot、CCGS、美术、音频保持为普通 skill/plugin/config。
+- [x] 增加 `SKILL_RUNTIME_TARGET_WORKSPACE` 与 `SKILL_RUNTIME_SKILL_REPOS`，分离执行工作区和 skill 仓库。
+- [x] 增加通用 `Capability Registry`，支持 env、`.codex-skill-runtime/capabilities.json`、plugin manifest `capabilities`。
+- [x] 增加 `capability_list` runtime action，并把 capability registry 注入模型上下文。
+- [x] 增加持久 `JobRegistry`，UI 启动任务写入 `jobs/jobs.json`。
+- [x] 增加本地 plugin enable/disable lifecycle，状态写入 runtime state，不实现 marketplace。
+- [x] 强化 SkillTool 机制：短列表预算、touched path 可见性、nested skill invocation、invoked skill preservation。
+- [x] 强化权限/hook 机制：`allowed-tools` 未预批准时暂停，增加 `PostToolUseFailure`。
+- [x] Web UI 升级为通用控制台：target、skills、sessions、jobs、capabilities、plugins、question/resume/stop。
+- [x] 新增 `generic-platform-contract`，不依赖 CCGS 验证通用 skill/plugin 机制。

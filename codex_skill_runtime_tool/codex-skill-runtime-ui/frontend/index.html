@@ -13,25 +13,27 @@
           <div class="brand-mark">CSR</div>
           <div>
             <h1>Skill Runtime</h1>
-            <p>通用任务观察器</p>
+            <p>通用技能运行控制台</p>
           </div>
         </div>
 
         <section class="panel launch-panel">
           <div class="panel-title">新任务</div>
+          <label for="target-workspace">目标工作区</label>
+          <input id="target-workspace" placeholder="留空使用环境配置" />
           <label for="skill-filter">选择 Skill</label>
-          <input id="skill-filter" placeholder="搜索，例如 ccgs、art、audio、godot" />
+          <input id="skill-filter" placeholder="搜索，例如 ccgs、art、audio、review" />
           <select id="skill-select" class="skill-select">
             <option value="">手动输入 slash command</option>
           </select>
           <label for="run-command">Slash command</label>
-          <input id="run-command" placeholder="/ccgs:prototype 或 /art:2d-art-pipeline" />
+          <input id="run-command" placeholder="/namespace:skill 或 /skill-name" />
           <label for="run-arguments">任务说明</label>
           <textarea id="run-arguments" rows="4" placeholder="输入你希望 skill 完成的任务"></textarea>
           <div class="run-options">
             <label class="check-row">
-              <input id="strict-tools" type="checkbox" />
-              <span>启用 runtime 结构化工具循环</span>
+              <input id="strict-tools" type="checkbox" checked />
+              <span>启用结构化工具循环</span>
             </label>
             <label for="qa-mode">QA 模式</label>
             <select id="qa-mode">
@@ -39,7 +41,7 @@
               <option value="off">off</option>
               <option value="required">required</option>
             </select>
-            <label for="max-steps">最大步骤</label>
+            <label for="max-steps">最大步数</label>
             <input id="max-steps" type="number" min="1" max="80" value="8" />
           </div>
           <button id="run-button">启动任务</button>
@@ -100,6 +102,24 @@
           <div class="question-input">
             <input id="answer-input" placeholder="输入答案后继续" />
             <button id="answer-button">提交并继续</button>
+          </div>
+        </section>
+
+        <section class="panel console-panel">
+          <div class="panel-title">运行控制</div>
+          <div class="control-grid">
+            <div>
+              <h3>持久 Job</h3>
+              <div id="jobs" class="jobs-list"></div>
+            </div>
+            <div>
+              <h3>Capability Registry</h3>
+              <div id="capabilities" class="capability-list"></div>
+            </div>
+            <div>
+              <h3>本地插件</h3>
+              <div id="plugins" class="plugin-list"></div>
+            </div>
           </div>
         </section>
 

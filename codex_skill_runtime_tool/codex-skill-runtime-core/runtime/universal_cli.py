@@ -12,6 +12,7 @@ from typing import Callable
 from .codex_cli import CodexCLI
 from .mcp import discover_mcp_servers
 from .mcp_oauth import complete_oauth_authorization, start_oauth_authorization
+from .plugins import set_plugin_enabled
 from .runtime import CodexSkillRuntime, RuntimeResult
 from .selftest import SelfTester
 
@@ -19,6 +20,8 @@ from .selftest import SelfTester
 @dataclass(frozen=True)
 class RuntimeConfig:
     root: Path
+    target_workspace: Path | None = None
+    skill_repos: tuple[Path, ...] = ()
     runtime_env_file: Path | None = None
     codex: str = "codex"
     model: str | None = None
@@ -66,10 +69,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--root",
         default=str(Path.cwd()),
         help=(
-            "Skill repository root. Supported layouts include .claude/skills, "
-            ".claude/commands, skills/, commands/, agents/, .claude-plugin, and root SKILL.md."
+            "Legacy root. If --target-workspace is omitted this is also the execution workspace; "
+            "if --skill-repo/SKILL_RUNTIME_SKILL_REPOS is omitted it is also a skill repository."
         ),
     )
+    parser.add_argument("--target-workspace", default=None, help="Workspace where Codex executes and where write tools are allowed.")
+    parser.add_argument("--skill-repo", action="append", default=[], help="Skill/plugin repository to load. Repeatable.")
     parser.add_argument("--runtime-env", default=None, help="Load skill-runtime settings from a .env-style file and isolate Codex config.")
     parser.add_argument("--runtime-state-root", default=None, help="Directory for runtime sessions, memory, MCP tokens, bridge, voice, and IDE state.")
     parser.add_argument("--codex", default="codex", help="Path to codex executable.")
@@ -106,6 +111,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("inspect", help="Inspect the loaded skill repository.")
     sub.add_parser("skills", help="List discovered skills and slash commands.")
     sub.add_parser("agents", help="List discovered agents.")
+    sub.add_parser("plugins", help="List discovered local plugins and enablement state.")
+
+    plugin = sub.add_parser("plugin", help="Enable or disable a local plugin by name.")
+    plugin.add_argument("operation", choices=["enable", "disable"])
+    plugin.add_argument("name")
+    plugin.add_argument("--plugin-root", dest="plugin_root", default=None, help="Optional exact plugin root path.")
 
     run = sub.add_parser("run", help="Run a slash command from the loaded skill repository.")
     run.add_argument("invocation", nargs=argparse.REMAINDER, help="Slash command and arguments, e.g. /prototype idea --path engine.")
@@ -146,6 +157,17 @@ def _config_from_args(args: argparse.Namespace, *, argv: list[str] | None = None
     root = Path(
         _effective_text(args, "root", runtime_env, ("SKILL_RUNTIME_ROOT",), explicit, ("--root",))
     ).expanduser().resolve()
+    target_workspace_value = _effective_optional_text(
+        args,
+        "target_workspace",
+        runtime_env,
+        ("SKILL_RUNTIME_TARGET_WORKSPACE", "SKILL_RUNTIME_WORKSPACE"),
+        explicit,
+        ("--target-workspace",),
+    )
+    target_workspace = Path(target_workspace_value).expanduser().resolve() if target_workspace_value else root
+    add_dirs = tuple(_effective_add_dirs(args, runtime_env))
+    skill_repos = tuple(_effective_skill_repos(args, runtime_env, root=root, add_dirs=add_dirs))
     codex = _effective_text(
         args,
         "codex",
@@ -170,7 +192,7 @@ def _config_from_args(args: argparse.Namespace, *, argv: list[str] | None = None
         explicit,
         ("--codex-profile",),
     )
-    codex_env = _codex_env_from_args(args, runtime_env=runtime_env, explicit=explicit, root=root, runtime_env_file=runtime_env_file)
+    codex_env = _codex_env_from_args(args, runtime_env=runtime_env, explicit=explicit, root=target_workspace, runtime_env_file=runtime_env_file)
     codex_config = _codex_config_from_args(args, runtime_env=runtime_env, explicit=explicit)
     runtime_state_root = _effective_optional_text(
         args,
@@ -185,6 +207,8 @@ def _config_from_args(args: argparse.Namespace, *, argv: list[str] | None = None
 
     config = RuntimeConfig(
         root=root,
+        target_workspace=target_workspace,
+        skill_repos=skill_repos,
         runtime_env_file=runtime_env_file,
         codex=codex,
         model=model,
@@ -212,7 +236,7 @@ def _config_from_args(args: argparse.Namespace, *, argv: list[str] | None = None
             ("--strict-schema", "--no-strict-schema"),
         ),
         max_steps=_effective_int(args, "max_steps", runtime_env, ("SKILL_RUNTIME_MAX_STEPS",), explicit, ("--max-steps",)),
-        add_dirs=tuple(_effective_add_dirs(args, runtime_env)),
+        add_dirs=add_dirs,
         output_style=_effective_optional_text(args, "output_style", runtime_env, ("SKILL_RUNTIME_OUTPUT_STYLE",), explicit, ("--output-style",)),
         system_prompt=_effective_optional_text(args, "system_prompt", runtime_env, ("SKILL_RUNTIME_SYSTEM_PROMPT",), explicit, ("--system-prompt",)),
         append_system_prompt=_effective_optional_text(args, "append_system_prompt", runtime_env, ("SKILL_RUNTIME_APPEND_SYSTEM_PROMPT",), explicit, ("--append-system-prompt",)),
@@ -225,12 +249,15 @@ def _runtime_from_config(config: RuntimeConfig) -> CodexSkillRuntime:
     config = _prepare_runtime_state_root(_prepare_isolated_codex_home(config))
     if config.godot:
         os.environ.setdefault("GODOT_EXE", config.godot)
+    target_workspace = (config.target_workspace or config.root).resolve()
+    skill_repos = tuple(config.skill_repos or (config.root, *config.add_dirs))
+    codex_add_dirs = _unique_paths([*config.add_dirs, *skill_repos])
     return CodexSkillRuntime(
-        project_root=config.root,
+        project_root=target_workspace,
         codex=CodexCLI(
             executable=config.codex,
             model=config.model,
-            add_dirs=list(config.add_dirs),
+            add_dirs=codex_add_dirs,
             env=config.codex_env or {},
             config_overrides=config.codex_config,
             profile=config.codex_profile,
@@ -239,7 +266,7 @@ def _runtime_from_config(config: RuntimeConfig) -> CodexSkillRuntime:
         assume_yes=config.assume_yes,
         qa_mode=config.qa,
         godot=config.godot,
-        additional_dirs=list(config.add_dirs),
+        additional_dirs=list(skill_repos),
         output_style=config.output_style,
         system_prompt=config.system_prompt,
         append_system_prompt=config.append_system_prompt,
@@ -301,7 +328,7 @@ def _codex_env_from_args(
     if args.codex_home:
         codex_home = args.codex_home
     if not codex_home and runtime_env_file is not None:
-        codex_home = str(root / ".skill-runtime" / "codex-home")
+        codex_home = str(_runtime_app_root() / ".skill-runtime" / "codex-home")
     if codex_home:
         env["CODEX_HOME"] = str(Path(codex_home).expanduser().resolve())
     return env
@@ -311,7 +338,17 @@ def _apply_runtime_process_env(runtime_env: dict[str, str]) -> None:
     for key, value in runtime_env.items():
         if key.startswith("SKILL_RUNTIME_ENV_") and len(key) > len("SKILL_RUNTIME_ENV_"):
             os.environ[key.removeprefix("SKILL_RUNTIME_ENV_")] = value
-        elif key in {"SKILL_RUNTIME_NAMESPACES", "CODEX_SKILL_RUNTIME_NAMESPACES"}:
+        elif key in {
+            "SKILL_RUNTIME_NAMESPACES",
+            "CODEX_SKILL_RUNTIME_NAMESPACES",
+            "SKILL_RUNTIME_CAPABILITIES_JSON",
+            "CODEX_SKILL_RUNTIME_CAPABILITIES_JSON",
+            "SKILL_RUNTIME_MODEL_CONTEXT_WINDOW",
+            "SKILL_RUNTIME_QA_AUTO_PATTERNS",
+            "CODEX_SKILL_RUNTIME_QA_AUTO_PATTERNS",
+        }:
+            os.environ[key] = value
+        elif key.startswith("SKILL_RUNTIME_CAPABILITY_") or key.startswith("CODEX_SKILL_RUNTIME_CAPABILITY_"):
             os.environ[key] = value
 
 
@@ -567,6 +604,20 @@ def _effective_add_dirs(args: argparse.Namespace, runtime_env: dict[str, str]) -
     return [Path(value).expanduser().resolve() for value in values]
 
 
+def _effective_skill_repos(
+    args: argparse.Namespace,
+    runtime_env: dict[str, str],
+    *,
+    root: Path,
+    add_dirs: tuple[Path, ...],
+) -> list[Path]:
+    values = _split_list(_first_env(runtime_env, ("SKILL_RUNTIME_SKILL_REPOS", "SKILL_RUNTIME_SKILL_REPOSITORIES")))
+    values.extend(str(value) for value in getattr(args, "skill_repo", []) if str(value).strip())
+    if values:
+        return _unique_paths([*(Path(value).expanduser().resolve() for value in values), *add_dirs])
+    return _unique_paths([root, *add_dirs])
+
+
 def _split_list(value: str | None) -> list[str]:
     if value is None:
         return []
@@ -583,6 +634,17 @@ def _split_list(value: str | None) -> list[str]:
         return [str(item).strip() for item in parsed if str(item).strip()]
     separator = "||" if "||" in stripped else ";"
     return [part.strip() for part in stripped.split(separator) if part.strip()]
+
+
+def _unique_paths(paths) -> list[Path]:
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in paths:
+        resolved = Path(path).expanduser().resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(resolved)
+    return result
 
 
 def _parse_bool_text(value: str, *, default: bool) -> bool:
@@ -693,6 +755,20 @@ def _dispatch_noninteractive(
             print(agent)
         return 0
 
+    if args.command_name == "plugins":
+        print(json.dumps(runtime.inspect().get("plugins", []), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command_name == "plugin":
+        state = set_plugin_enabled(
+            config.target_workspace or config.root,
+            name=args.name,
+            root=args.plugin_root,
+            enabled=args.operation == "enable",
+        )
+        print(json.dumps({"ok": True, "state": state}, ensure_ascii=False, indent=2))
+        return 0
+
     if args.command_name == "run":
         if not args.invocation:
             parser.error("run requires a slash command, e.g. skill-runtime run /prototype ...")
@@ -726,15 +802,17 @@ def _dispatch_noninteractive(
         return result.exit_code
 
     if args.command_name == "selftest":
+        skill_repos = list(config.skill_repos or (config.root, *config.add_dirs))
+        loaded_root = skill_repos[0] if skill_repos else config.root
         tester = SelfTester(
-            project_root=config.root,
+            project_root=loaded_root,
             codex_executable=config.codex,
             model=config.model,
             godot=config.godot,
             godot_project=Path(args.godot_project) if args.godot_project else None,
             live_qa_target=Path(args.live_qa_target) if args.live_qa_target else None,
             live_strict_target=args.live_strict_target,
-            additional_dirs=list(config.add_dirs),
+            additional_dirs=_unique_paths([*skill_repos[1:], *config.add_dirs]),
         )
         return tester.run_all()
 
@@ -753,10 +831,11 @@ def _run_invocation(runtime: CodexSkillRuntime, config: RuntimeConfig, invocatio
 
 
 def _mcp_auth(config: RuntimeConfig, server_name: str, *, callback_url: str | None, code: str | None) -> int:
-    server = _find_mcp_server(config.root, server_name)
+    target_workspace = config.target_workspace or config.root
+    server = _find_mcp_server(target_workspace, server_name, additional_dirs=list(config.skill_repos))
     if callback_url or code:
         record = complete_oauth_authorization(
-            project_root=config.root,
+            project_root=target_workspace,
             server_name=server.name,
             config=server.config,
             code=code,
@@ -765,7 +844,7 @@ def _mcp_auth(config: RuntimeConfig, server_name: str, *, callback_url: str | No
         print(json.dumps({"status": "authenticated", "server": server.name, "key": record.key, "expires_at": record.expires_at}, ensure_ascii=False, indent=2))
         return 0
     result = start_oauth_authorization(
-        project_root=config.root,
+        project_root=target_workspace,
         server_name=server.name,
         config=server.config,
         plugin_root=server.plugin_root,
@@ -775,8 +854,8 @@ def _mcp_auth(config: RuntimeConfig, server_name: str, *, callback_url: str | No
     return 0 if result.get("status") in {"auth_url", "authenticated"} else 2
 
 
-def _find_mcp_server(project_root: Path, name: str):
-    servers = discover_mcp_servers(project_root)
+def _find_mcp_server(project_root: Path, name: str, *, additional_dirs: list[Path] | None = None):
+    servers = discover_mcp_servers(project_root, additional_dirs=additional_dirs)
     for server in servers:
         if name == server.name or name in server.aliases:
             return server
@@ -788,7 +867,8 @@ def _interactive_loop(initial: RuntimeConfig) -> int:
     config = initial
     print("Codex Skill Runtime")
     print("输入 help 查看命令；输入 exit 退出。")
-    print(f"当前加载仓库: {config.root}")
+    print(f"目标工作区: {config.target_workspace or config.root}")
+    print(f"技能仓库: {', '.join(str(path) for path in (config.skill_repos or (config.root,)))}")
     while True:
         try:
             line = input("skill-runtime> ").lstrip("\ufeff").strip()
@@ -858,7 +938,7 @@ def _ui_help(config: RuntimeConfig, rest: str) -> RuntimeConfig:
         "\n".join(
             [
                 "可用命令:",
-                "  load <path>                  加载一个 skill 仓库",
+                "  load <path>                  追加加载一个 skill 仓库",
                 "  status                       查看当前配置",
                 "  inspect                      输出当前仓库的 skills / agents / context",
                 "  skills [filter]              列出 skills 和 slash commands",
@@ -885,6 +965,7 @@ def _ui_help(config: RuntimeConfig, rest: str) -> RuntimeConfig:
                 "  set env KEY=VALUE                   Set any codex child-process environment variable",
                 "  set config KEY=VALUE                Add raw codex --config override",
                 "  set profile <name|clear>            Set codex --profile",
+                "  set workspace <path>         设置目标工作区",
                 "  set max-steps <n>            设置 strict action-loop 最大轮数",
                 "  exit                         退出",
             ]
@@ -903,7 +984,8 @@ def _ui_load(config: RuntimeConfig, rest: str) -> RuntimeConfig:
         print("用法: load <skill-repo-path>")
         return config
     root = Path(rest.strip().strip("\"'")).expanduser().resolve()
-    next_config = replace(config, root=root)
+    repos = _unique_paths([*(config.skill_repos or (config.root,)), root])
+    next_config = replace(config, root=config.root, skill_repos=tuple(repos))
     runtime = _runtime_from_config(next_config)
     data = runtime.inspect()
     print(f"已加载: {root}")
@@ -912,7 +994,7 @@ def _ui_load(config: RuntimeConfig, rest: str) -> RuntimeConfig:
 
 
 def _ui_root(config: RuntimeConfig, rest: str) -> RuntimeConfig:
-    print(config.root)
+    print(config.target_workspace or config.root)
     return config
 
 
@@ -1027,6 +1109,11 @@ def _ui_set(config: RuntimeConfig, rest: str) -> RuntimeConfig:
         return replace(config, model=None if value.lower() == "clear" else value)
     if key == "profile":
         return replace(config, codex_profile=None if value.lower() == "clear" else value)
+    if key == "workspace":
+        if not value:
+            print("用法: set workspace <path>")
+            return config
+        return replace(config, target_workspace=Path(value.strip("\"'")).expanduser().resolve())
     if key == "api-key":
         if value.lower() == "clear":
             env.pop("OPENAI_API_KEY", None)
@@ -1142,6 +1229,8 @@ def _print_filtered(values: object, filter_text: str) -> None:
 def _config_to_json(config: RuntimeConfig) -> dict[str, object]:
     return {
         "root": str(config.root),
+        "target_workspace": str(config.target_workspace) if config.target_workspace else None,
+        "skill_repos": [str(path) for path in config.skill_repos],
         "runtime_env_file": str(config.runtime_env_file) if config.runtime_env_file else None,
         "codex": config.codex,
         "model": config.model,

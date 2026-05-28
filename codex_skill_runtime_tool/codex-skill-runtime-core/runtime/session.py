@@ -20,7 +20,7 @@ class RuntimeEvent:
 
 
 class RuntimeSession:
-    def __init__(self, root: Path, label: str) -> None:
+    def __init__(self, root: Path, label: str, *, metadata: dict[str, Any] | None = None) -> None:
         now = datetime.now().strftime("%Y%m%d-%H%M%S")
         clean_label = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in label)
         self.id = f"{now}-{clean_label}".strip("-")
@@ -35,6 +35,7 @@ class RuntimeSession:
         self._nodes: dict[str, dict[str, Any]] = {}
         self._root_node_id: str | None = None
         self._status = "created"
+        self.metadata = dict(metadata or {})
         self._write_ui_state()
 
     def path(self, *parts: str) -> Path:
@@ -165,6 +166,100 @@ class RuntimeSession:
             )
             self._write_ui_state()
 
+    def set_metadata(self, **metadata: Any) -> None:
+        with self._state_lock:
+            self.metadata.update({key: value for key, value in metadata.items() if value is not None})
+            self._write_ui_state()
+
+    def touched_paths(self) -> list[str]:
+        paths: list[str] = []
+        read_state = self.path("read-state.json")
+        if read_state.exists():
+            try:
+                data = json.loads(read_state.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, ValueError):
+                data = {}
+            if isinstance(data, dict):
+                paths.extend(str(item.get("path") or key) for key, item in data.items() if isinstance(item, dict))
+        artifacts_path = self.path("artifacts.json")
+        if artifacts_path.exists():
+            try:
+                artifacts = json.loads(artifacts_path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, ValueError):
+                artifacts = {}
+            items = artifacts.get("artifacts") if isinstance(artifacts, dict) else []
+            if isinstance(items, list):
+                paths.extend(str(item.get("path")) for item in items if isinstance(item, dict) and item.get("path"))
+        return _unique_text(paths)
+
+    def record_invoked_skill(
+        self,
+        *,
+        name: str,
+        path: Path,
+        content: str,
+        agent: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        max_chars: int = 60000,
+    ) -> None:
+        record = {
+            "name": name,
+            "path": str(path),
+            "agent": agent or "",
+            "content": content[:max_chars],
+            "truncated": len(content) > max_chars,
+            "metadata": metadata or {},
+            "invoked_at": _now(),
+        }
+        target = self.path("invoked-skills.json")
+        try:
+            data = json.loads(target.read_text(encoding="utf-8", errors="replace")) if target.exists() else {}
+        except (OSError, ValueError):
+            data = {}
+        records = data.get("skills") if isinstance(data, dict) else []
+        if not isinstance(records, list):
+            records = []
+        records = [item for item in records if isinstance(item, dict) and not (item.get("name") == name and item.get("agent") == (agent or ""))]
+        records.insert(0, record)
+        target.write_text(json.dumps({"session_id": self.id, "skills": records[:100]}, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.event("skill.invoked", f"Loaded skill {name}", path=str(path), agent=agent or "")
+
+    def invoked_skills_context(self, *, max_chars: int = 40000) -> str:
+        target = self.path("invoked-skills.json")
+        if not target.exists():
+            return ""
+        try:
+            data = json.loads(target.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return ""
+        records = data.get("skills") if isinstance(data, dict) else []
+        if not isinstance(records, list) or not records:
+            return ""
+        lines = [
+            "## Runtime Invoked Skills",
+            "",
+            "These skills were previously loaded in this session. Preserve their operative instructions across compacted tool observations.",
+            "",
+        ]
+        remaining = max_chars
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content") or "")
+            block = (
+                f"### {item.get('name', '')}\n\n"
+                f"Source: `{item.get('path', '')}`\n"
+                f"Agent: `{item.get('agent', '')}`\n\n"
+                f"{content}\n"
+            )
+            if len(block) > remaining:
+                block = block[:remaining] + "\n[TRUNCATED INVOKED SKILL]\n"
+            lines.append(block)
+            remaining -= len(block)
+            if remaining <= 0:
+                break
+        return "\n".join(lines).strip()
+
     def event(self, type_: str, message: str, **data: Any) -> None:
         event = RuntimeEvent(type=type_, message=message, data=data)
         with self.events_path.open("a", encoding="utf-8") as handle:
@@ -268,6 +363,8 @@ class RuntimeSession:
         state = {
             "session_id": self.id,
             "label": self.label,
+            "root": str(self.root),
+            "metadata": self.metadata,
             "status": self._effective_session_status(active_nodes),
             "current_skill": current_skill,
             "current_agents": current_agents,
@@ -315,6 +412,17 @@ def _split_namespace(value: str) -> tuple[str, str]:
         return "", value
     namespace, name = value.split(":", 1)
     return namespace, name
+
+
+def _unique_text(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "")
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
 
 
 def _node_action(node: dict[str, Any]) -> str:

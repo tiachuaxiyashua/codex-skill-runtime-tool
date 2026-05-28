@@ -1,6 +1,6 @@
 # Codex Skill Runtime Web UI
 
-这是一个通用的本地 Web 观察器，不绑定 CCGS。它只读取 Codex Skill Runtime 写出的通用状态文件，并按统一结构展示任意 skill 的执行过程。
+这是通用 Web 控制台，不绑定 CCGS、Godot、美术或音频管线。它读取 runtime 的通用状态文件，并通过 HTTP API 启动、观察、继续、停止任务。
 
 ## 启动
 
@@ -16,46 +16,62 @@ python -B codex_skill_runtime_tool\runtime-ui.py --port 8765
 http://127.0.0.1:8765
 ```
 
-默认读取：
+默认配置文件：
 
 ```text
 codex_skill_runtime_tool\config\skill-runtime.env
 ```
 
-也可以显式指定：
+显式指定配置：
 
 ```powershell
 python -B codex_skill_runtime_tool\runtime-ui.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env --port 8765
 ```
 
-## MVP 功能
+## UI 能看到什么
 
-- 从 UI 查看所有可用 skill，并点击填入 slash command。
-- 从 UI 启动任意 slash command，不限制命名空间。
-- 可选择 strict tools、QA 模式和最大步骤数。
-- 查看历史 session、当前 session 状态、当前 skill、当前 agent、并行 agent 数量。
-- 查看任务树，节点类型包括 session、skill、agent、parallel group、tool、gate、question、artifact。
-- 查看并行 agent 泳道，并用动画标识运行中或等待用户的状态。
-- 查看事件时间线、prompt/stdout/stderr/last-message 等证据文件。
-- 预览图片和音频产物。
-- 从当前 session 断点继续。
-- 回答 pending question 并继续执行。
+- 当前目标工作区。
+- 当前加载的 skill 列表。
+- 当前 session 状态、当前 skill、当前 agent、并行 agent 数。
+- 历史任务树。
+- agent 泳道和运行状态动画。
+- 工具调用、hook、gate、question、artifact。
+- 图片、音频、文档类产物预览。
+- prompt、stdout、stderr、last-message、strict-result 等证据文件。
+- pending question，并可直接回答后继续。
+- 持久 Job 列表，并可请求停止。
+- Capability Registry。
+- 本地 plugin 启用/停用。
+
+## UI 不做什么
+
+- 不把 CCGS 写死进界面。
+- 不理解某个游戏、美术、音频 skill 的内部业务流程。
+- 不保存或显示 API key。
+- 不替代 skill 本身的决策，只负责启动、观察、继续和控制 runtime。
 
 ## 数据来源
 
-UI 优先读取每个 session 内的结构化文件：
+每个 session 主要读取：
 
 ```text
 session-state.json
 task-tree.json
 artifacts.json
+events.jsonl
+transcript.jsonl
+summary.json
+pending-question.json
 ```
 
-旧 session 如果没有这些文件，UI 会从 `events.jsonl` 尽量重建一棵简化任务树。
+持久 Job 读取：
 
-## 设计边界
+```text
+<state-root>\jobs\jobs.json
+```
 
-- UI 不知道 CCGS、Godot、美术或音频管线的专有逻辑。
-- 工具能力仍由 runtime core、加载的 skill、agent、MCP 和插件决定。
-- UI 只负责启动、观察、追溯、继续和回答问题。
-- API key 不会从健康检查接口返回；页面只展示配置文件路径和 base URL。
+插件启停状态读取：
+
+```text
+<state-root>\plugins\plugins.json
+```

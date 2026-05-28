@@ -1,49 +1,90 @@
-# 本工程内的唯一运行配置
+# Runtime 配置说明
 
-正式配置文件只有这一份：
-
-```text
-<tool-root>\config\skill-runtime.env
-```
-
-API key 文件在：
+本工程只保留一个运行配置入口：
 
 ```text
-<tool-root>\config\codex_api_key.txt
+codex_skill_runtime_tool\config\skill-runtime.env
 ```
 
-约定：
+真实 API key 放在：
 
-- `skill-runtime.env` 保存模型、代理地址、加载哪些 skill 仓库、runtime 行为开关。
-- `codex_api_key.txt` 保存真实 API key，不写进 env，不提交 Git。
-- 不再使用 `codex-skill-runtime\skill-runtime.env` 作为配置入口。
+```text
+codex_skill_runtime_tool\config\codex_api_key.txt
+```
 
-本地资产管线地址也写在 `skill-runtime.env`：
+不要把真实 API key 写进 git。
+
+## 关键配置
 
 ```env
-# 2D 美术管线，Stability Matrix 启动 Forge/A1111 时需要启用 --api。
-SKILL_RUNTIME_ENV_FORGE_BASE_URL=http://127.0.0.1:7860
-
-# 音频管线，Stability Matrix 启动 ComfyUI。
-SKILL_RUNTIME_ENV_COMFYUI_BASE_URL=http://127.0.0.1:8188
+SKILL_RUNTIME_TARGET_WORKSPACE=...
+SKILL_RUNTIME_SKILL_REPOS=...
+SKILL_RUNTIME_NAMESPACES=...
+SKILL_RUNTIME_STATE_ROOT=...
+SKILL_RUNTIME_CODEX_HOME=...
+CODEX_BASE_URL=...
+CODEX_API_KEY_FILE=...
 ```
 
-运行器生成的 `config.toml`、`auth.json`、session、memory、MCP token、bridge、voice、IDE 状态都会写到：
+含义：
+
+- `SKILL_RUNTIME_TARGET_WORKSPACE`：Codex 真正工作的目录。
+- `SKILL_RUNTIME_SKILL_REPOS`：要加载的 skill/plugin 仓库列表，使用 `;` 分隔。
+- `SKILL_RUNTIME_NAMESPACES`：给 skill repo 绑定命名空间，例如 `ccgs=...;art=...`。
+- `SKILL_RUNTIME_STATE_ROOT`：session、memory、job、plugin state 等 runtime 自己的状态目录。
+- `SKILL_RUNTIME_CODEX_HOME`：隔离的 Codex 配置目录，避免污染本机其他 Codex 配置。
+- `CODEX_BASE_URL`：你的 Codex/OpenAI 兼容代理地址。
+- `CODEX_API_KEY_FILE`：API key 文件路径。
+- `SKILL_RUNTIME_QA_AUTO_PATTERNS`：`qa=auto` 时触发 QA 的可配置模式，格式是 `command:argument-glob`，使用 `;` 分隔。
+
+## 内置变量
+
+env 文件支持：
 
 ```text
-<tool-root>\.skill-runtime\
+${SKILL_RUNTIME_TOOL_ROOT}
+${SKILL_RUNTIME_WORKSPACE_ROOT}
 ```
 
-被加载的 skill 仓库仍然是独立目录，例如：
+其中：
+
+- `SKILL_RUNTIME_TOOL_ROOT` 是 `codex_skill_runtime_tool`。
+- `SKILL_RUNTIME_WORKSPACE_ROOT` 是 `codex_skill_runtime_tool` 的父目录。
+
+## Capability Registry 配置
+
+外部服务不要写死进 runtime core。可以通过通用 capability 暴露：
+
+```env
+SKILL_RUNTIME_CAPABILITY_FORGE_ENDPOINT=http://127.0.0.1:7860
+SKILL_RUNTIME_CAPABILITY_FORGE_KIND=image-generation-api
+SKILL_RUNTIME_CAPABILITY_FORGE_STATUS=configured
+SKILL_RUNTIME_CAPABILITY_FORGE_DESCRIPTION=Stability Matrix Forge or A1111-compatible backend exposed with --api.
+```
+
+也可以在 skill/plugin 仓库里放：
 
 ```text
-<workspace-root>\game_studio_source_code\Claude-Code-Game-Studios
+.codex-skill-runtime\capabilities.json
 ```
 
-`<tool-root>` 是：
+或在 `.claude-plugin\plugin.json` 中写 `capabilities` 字段。
+
+## 当前目录约定
+
+runtime 自己产生的文件都在工程内：
 
 ```text
-codex_skill_runtime_tool
+codex_skill_runtime_tool\.skill-runtime\
 ```
 
-`<workspace-root>` 是 `codex_skill_runtime_tool` 的父目录。环境文件中可以直接使用内置变量 `${SKILL_RUNTIME_TOOL_ROOT}` 和 `${SKILL_RUNTIME_WORKSPACE_ROOT}`。
+被加载的 skill 仓库是独立目录，例如：
+
+```text
+game_studio_source_code\Claude-Code-Game-Studios
+art_pipeline_skill
+audio_pipeline_skill
+godot_tool_bridge_skill
+```
+
+这些目录是 skill/plugin，不是 runtime core。

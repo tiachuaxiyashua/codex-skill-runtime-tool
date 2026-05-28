@@ -222,6 +222,7 @@ class StrictActionLoop:
             qa_mode=qa_mode,
             runtime_profile=runtime_profile,
         )
+        invoked_skills = self.session.invoked_skills_context()
         compacted_observations, compacted_records = compact_observations(
             observations,
             session_dir=self.session.dir,
@@ -233,7 +234,9 @@ class StrictActionLoop:
                 records=compacted_records,
             )
 
-        return f"""{base}
+        invoked_section = f"\n\n---\n\n{invoked_skills}" if invoked_skills else ""
+
+        return f"""{base}{invoked_section}
 
 ## Strict Runtime Action Mode
 
@@ -256,6 +259,7 @@ Available tools:
 - project_memory_read: parameters optional `section`; reads runtime-owned global style, asset manifest, or project notes
 - project_memory_write: parameters `section`, `content`, optional `append`; writes runtime-owned global style or project notes
 - asset_register: parameters `asset` object; appends one generated or imported asset record to runtime-owned asset manifest
+- capability_list: optional `namespace`; lists generic runtime capabilities discovered from loaded skill/plugin manifests and runtime env
 - send_message: parameters `to`, `message`; continues a previous worker returned by task/agent
 - task_stop: parameters `to` or `task_id`, optional `reason`; stops a worker in the runtime registry
 - memory_read: parameters optional `agent`, optional `scope`

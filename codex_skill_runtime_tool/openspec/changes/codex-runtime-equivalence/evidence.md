@@ -155,3 +155,52 @@ PASS: live-codex-qa-contract - session=20260523-034817-agent-qa-tester gate=PASS
 PASS: claude-tree-clean - .claude diff is empty
 SELFTEST_SUMMARY total=17 failed=0
 ```
+
+## 2026-05-29 Generic Runtime Platform Evidence
+
+本轮目标是补齐参考工程中会影响通用 skill 执行效果的 1-9 条机制，并避免 runtime 变成游戏专用工具。
+
+已运行：
+
+```powershell
+python -B -m compileall codex_skill_runtime_tool\codex-skill-runtime-core codex_skill_runtime_tool\codex-skill-runtime-ui\backend
+python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env inspect
+python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env selftest --godot-project game_projects\marble_spiral_runtime
+```
+
+结果：
+
+```text
+PASS: generic-platform-contract - target=...\target-workspace skill_repo=...\skill-repo
+PASS: godot-contract - session=20260529-011558-selftest-godot-plugin-live
+SKIP: external-layout-contract - external GitHub skill repositories not downloaded
+SKIP: live-strict-contract - no --live-strict-target supplied
+SKIP: live-codex-qa-contract - no --live-qa-target supplied
+PASS: claude-tree-clean - .claude diff is empty
+SELFTEST_SUMMARY total=35 failed=0
+```
+
+Web UI smoke：
+
+```text
+GET /api/health
+GET /api/capabilities
+GET /api/jobs
+```
+
+结果：
+
+```json
+{"ok":true,"target":"E:\\chuan_project\\claude_code_game_sutdio","capabilities":2,"jobs":0}
+```
+
+本轮新增验证点：
+
+- `target_workspace` 与 `skill_repos` 分离后仍能发现并运行 skill。
+- 多 skill repo 和 plugin namespace 正常。
+- `paths` frontmatter 能按 touched path 影响 SkillTool 可见性。
+- capability registry 从文件、plugin manifest、env 合并。
+- plugin enable/disable 会影响 skill 暴露。
+- `allowed-tools` 对未预批准工具会暂停。
+- nested skill action 会把 invoked skill 落盘，供压缩/恢复后保留。
+- UI job registry 可持久列出任务状态。

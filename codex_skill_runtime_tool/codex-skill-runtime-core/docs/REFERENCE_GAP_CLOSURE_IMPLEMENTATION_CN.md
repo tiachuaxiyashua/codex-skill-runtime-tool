@@ -102,7 +102,7 @@ live strict-smoke: STRICT-SMOKE PASS
 ```text
 python -B -m compileall codex_skill_runtime_tool\codex-skill-runtime-core codex_skill_runtime_tool\codex-skill-runtime-ui\backend
 python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env inspect
-python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env selftest --godot-project game_projects\marble_spiral_runtime
+python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env selftest
 ```
 
 结果：
@@ -122,7 +122,7 @@ GET /api/jobs
 结果：
 
 ```text
-ok=true, target=E:\chuan_project\claude_code_game_sutdio, capabilities=2, jobs=0
+ok=true, target=<workspace-root>, capabilities=2, jobs=0
 ```
 
 剩余边界：

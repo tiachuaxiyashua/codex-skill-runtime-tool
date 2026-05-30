@@ -55,7 +55,6 @@ class CodexSkillRuntime:
         dry_run: bool = False,
         assume_yes: bool = False,
         qa_mode: str = "auto",
-        godot: str | None = None,
         additional_dirs: list[Path] | None = None,
         output_style: str | None = None,
         system_prompt: str | None = None,
@@ -67,7 +66,6 @@ class CodexSkillRuntime:
         self.dry_run = dry_run
         self.assume_yes = assume_yes
         self.qa_mode = qa_mode
-        self.godot = godot
         self.additional_dirs = additional_dirs or []
         self.output_style = output_style
         self.strict_schema = strict_schema
@@ -341,7 +339,6 @@ class CodexSkillRuntime:
             hooks=hooks,
             session=session,
             assume_yes=self.assume_yes,
-            godot=self.godot,
             task_runner=task_runner,
             worker_registry=worker_registry,
             allowed_tools=skill.metadata.get("allowed-tools"),
@@ -646,7 +643,6 @@ class CodexSkillRuntime:
             hooks=self.hooks,
             session=session,
             assume_yes=True,
-            godot=self.godot,
             allowed_tools=["Read"],
             additional_dirs=self.additional_dirs,
         )
@@ -802,7 +798,6 @@ class CodexSkillRuntime:
                 hooks=active_hooks,
                 session=session,
                 assume_yes=self.assume_yes,
-                godot=self.godot,
                 task_runner=nested_task_runner,
                 allowed_tools=agent.metadata.get("tools"),
                 plugin_root=self.loader.plugin_root_for(agent.path),
@@ -1020,11 +1015,21 @@ class CodexSkillRuntime:
 
     def _infer_target_path(self, arguments: str, parent_result: str) -> str:
         for token in [*arguments.split(), *parent_result.split()]:
-            if "project.godot" in token:
-                return token.strip("`'\".,:;")
-        for token in [*arguments.split(), *parent_result.split()]:
             clean = token.strip("`'\".,:;")
-            if "prototypes/" in clean or "prototypes\\" in clean:
+            if not clean or clean.startswith("-"):
+                continue
+            candidate = Path(clean)
+            if not candidate.is_absolute():
+                candidate = self.project_root / candidate
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            try:
+                resolved.relative_to(self.project_root)
+            except ValueError:
+                continue
+            if resolved.exists():
                 return clean
         return str(self.project_root)
 

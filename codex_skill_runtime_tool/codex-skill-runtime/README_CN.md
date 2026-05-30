@@ -22,6 +22,24 @@ API key 文件也在本工程内：
 
 `skill-runtime.env` 是唯一正式运行配置文件。真实 API key 不写入 env，而是放入 `codex_api_key.txt`，避免提交代码时泄露。
 
+一键启动 Web UI 和依赖检查：
+
+```powershell
+.\start-runtime.ps1
+```
+
+双击启动入口：
+
+```text
+start-runtime.bat
+```
+
+只检查依赖、不启动 UI：
+
+```powershell
+.\start-runtime.ps1 -CheckOnly
+```
+
 当前推荐配置结构如下：
 
 ```env
@@ -178,7 +196,7 @@ python -B .\skill-runtime.py --root <skill-repo-root> --strict-tools --assume-ye
 对于 CCGS 的 Godot 原型，只是这样加载并运行：
 
 ```powershell
-python -B .\skill-runtime.py --root <skill-repo-root> --strict-tools --assume-yes --qa required --godot <godot-executable-or-dir> run /prototype "用Godot 4制作一个瓦片地图金币收集小游戏，要求玩家移动、墙阻挡、金币、步数HUD、胜利条件、重启、自动测试" --path engine --spike
+python -B .\skill-runtime.py --root <skill-repo-root> --strict-tools --assume-yes --qa required run /prototype "用Godot 4制作一个瓦片地图金币收集小游戏，要求玩家移动、墙阻挡、金币、步数HUD、胜利条件、重启、自动测试" --path engine --spike
 ```
 
 注意这里真正的通用结构是：
@@ -217,7 +235,6 @@ set strict on|off
 set qa auto|off|required
 set assume-yes on|off
 set dry-run on|off
-set godot <path|clear>
 set model <name|clear>
 set output-style <style|clear>
 set max-steps <n>
@@ -249,7 +266,7 @@ python -B .\skill-runtime.py --root <skill-repo-root> --strict-tools run /godot:
 交互：
 
 ```text
-set godot <godot-executable-or-dir>
+set env GODOT_EXE=<godot-executable-or-dir>
 strict /godot:godot-tool-bridge 检查 <godot-project>
 ```
 

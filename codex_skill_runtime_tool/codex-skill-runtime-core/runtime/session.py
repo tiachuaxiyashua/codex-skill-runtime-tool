@@ -443,8 +443,8 @@ def _artifact_type(path: str) -> str:
         return "audio"
     if suffix in {".md", ".txt", ".json", ".csv", ".tsv", ".yaml", ".yml"}:
         return "document"
-    if suffix in {".tscn", ".gd", ".godot", ".tres", ".res"}:
-        return "godot"
+    if suffix in {".py", ".js", ".ts", ".tsx", ".jsx", ".gd", ".cs", ".cpp", ".h", ".hpp", ".rs", ".go", ".java", ".kt", ".swift", ".lua"}:
+        return "code"
     return "file"
 
 

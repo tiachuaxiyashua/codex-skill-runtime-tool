@@ -35,7 +35,6 @@ class RuntimeConfig:
     dry_run: bool = False
     assume_yes: bool = False
     qa: str = "auto"
-    godot: str | None = None
     strict_tools: bool = True
     strict_schema: bool = True
     max_steps: int = 8
@@ -95,7 +94,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Prepare prompts without calling Codex.")
     parser.add_argument("--assume-yes", action="store_true", help="Allow runtime prompts to proceed without approval pauses.")
     parser.add_argument("--qa", choices=["auto", "off", "required"], default="auto", help="QA gate mode.")
-    parser.add_argument("--godot", default=None, help="Godot executable or directory.")
     parser.add_argument("--strict-tools", dest="strict_tools", action="store_true", default=True, help="Run slash commands through runtime-owned structured tool actions. Default: on.")
     parser.add_argument("--no-strict-tools", dest="strict_tools", action="store_false", help="Run slash commands as a single Codex prompt without structured tool mediation.")
     parser.add_argument("--strict-schema", dest="strict_schema", action="store_true", default=True, help="Use Codex --output-schema for strict action-loop steps. Default: on.")
@@ -119,7 +117,7 @@ def _build_parser() -> argparse.ArgumentParser:
     plugin.add_argument("--plugin-root", dest="plugin_root", default=None, help="Optional exact plugin root path.")
 
     run = sub.add_parser("run", help="Run a slash command from the loaded skill repository.")
-    run.add_argument("invocation", nargs=argparse.REMAINDER, help="Slash command and arguments, e.g. /prototype idea --path engine.")
+    run.add_argument("invocation", nargs=argparse.REMAINDER, help="Slash command and arguments, e.g. /namespace:skill task details.")
 
     agent = sub.add_parser("agent", help="Run one loaded agent directly.")
     agent.add_argument("agent_name")
@@ -142,7 +140,6 @@ def _build_parser() -> argparse.ArgumentParser:
     strict_smoke.add_argument("read_path", nargs="?", default="README.md")
 
     selftest = sub.add_parser("selftest", help="Run runtime self-tests against the loaded repository.")
-    selftest.add_argument("--godot-project", default=None, help="Optional Godot project to include in self-test.")
     selftest.add_argument("--live-qa-target", default=None, help="Optional project path for a real Codex qa-tester self-test.")
     selftest.add_argument("--live-strict-target", default=None, help="Optional file path for a real strict action-loop self-test.")
     return parser
@@ -218,7 +215,6 @@ def _config_from_args(args: argparse.Namespace, *, argv: list[str] | None = None
         dry_run=_effective_bool(args, "dry_run", runtime_env, ("SKILL_RUNTIME_DRY_RUN",), explicit, ("--dry-run",)),
         assume_yes=_effective_bool(args, "assume_yes", runtime_env, ("SKILL_RUNTIME_ASSUME_YES",), explicit, ("--assume-yes",)),
         qa=_effective_choice(args, "qa", runtime_env, ("SKILL_RUNTIME_QA",), explicit, ("--qa",), {"auto", "off", "required"}),
-        godot=_effective_optional_text(args, "godot", runtime_env, ("SKILL_RUNTIME_GODOT", "GODOT"), explicit, ("--godot",)),
         strict_tools=_effective_bool(
             args,
             "strict_tools",
@@ -247,8 +243,6 @@ def _config_from_args(args: argparse.Namespace, *, argv: list[str] | None = None
 
 def _runtime_from_config(config: RuntimeConfig) -> CodexSkillRuntime:
     config = _prepare_runtime_state_root(_prepare_isolated_codex_home(config))
-    if config.godot:
-        os.environ.setdefault("GODOT_EXE", config.godot)
     target_workspace = (config.target_workspace or config.root).resolve()
     skill_repos = tuple(config.skill_repos or (config.root, *config.add_dirs))
     codex_add_dirs = _unique_paths([*config.add_dirs, *skill_repos])
@@ -265,7 +259,6 @@ def _runtime_from_config(config: RuntimeConfig) -> CodexSkillRuntime:
         dry_run=config.dry_run,
         assume_yes=config.assume_yes,
         qa_mode=config.qa,
-        godot=config.godot,
         additional_dirs=list(skill_repos),
         output_style=config.output_style,
         system_prompt=config.system_prompt,
@@ -346,6 +339,7 @@ def _apply_runtime_process_env(runtime_env: dict[str, str]) -> None:
             "SKILL_RUNTIME_MODEL_CONTEXT_WINDOW",
             "SKILL_RUNTIME_QA_AUTO_PATTERNS",
             "CODEX_SKILL_RUNTIME_QA_AUTO_PATTERNS",
+            "CODEX_SKILL_RUNTIME_BARE",
         }:
             os.environ[key] = value
         elif key.startswith("SKILL_RUNTIME_CAPABILITY_") or key.startswith("CODEX_SKILL_RUNTIME_CAPABILITY_"):
@@ -771,7 +765,7 @@ def _dispatch_noninteractive(
 
     if args.command_name == "run":
         if not args.invocation:
-            parser.error("run requires a slash command, e.g. skill-runtime run /prototype ...")
+            parser.error("run requires a slash command, e.g. skill-runtime run /namespace:skill ...")
         result = _run_invocation(runtime, config, args.invocation)
         _print_result(result)
         return result.exit_code
@@ -808,8 +802,6 @@ def _dispatch_noninteractive(
             project_root=loaded_root,
             codex_executable=config.codex,
             model=config.model,
-            godot=config.godot,
-            godot_project=Path(args.godot_project) if args.godot_project else None,
             live_qa_target=Path(args.live_qa_target) if args.live_qa_target else None,
             live_strict_target=args.live_strict_target,
             additional_dirs=_unique_paths([*skill_repos[1:], *config.add_dirs]),
@@ -823,7 +815,7 @@ def _dispatch_noninteractive(
 def _run_invocation(runtime: CodexSkillRuntime, config: RuntimeConfig, invocation: list[str]) -> RuntimeResult:
     command = invocation[0]
     if not command.startswith("/"):
-        raise SystemExit("first run argument must be a slash command such as /prototype")
+        raise SystemExit("first run argument must be a slash command such as /namespace:skill")
     arguments = " ".join(invocation[1:])
     if config.strict_tools:
         return runtime.run_strict_skill(command, arguments, max_steps=config.max_steps)
@@ -955,7 +947,6 @@ def _ui_help(config: RuntimeConfig, rest: str) -> RuntimeConfig:
                 "  set qa auto|off|required     设置 QA gate",
                 "  set assume-yes on|off        设置自动回答 runtime pause",
                 "  set dry-run on|off           只生成 prompt，不调用 Codex",
-                "  set godot <path|clear>       设置 Godot 路径",
                 "  set model <name|clear>       设置 Codex model override",
                 "  set api-key <value|@file|clear>     Set OPENAI_API_KEY for codex child process",
                 "  set base-url <url|clear>            Set a proxy/OpenAI-compatible base URL for codex",
@@ -1103,8 +1094,6 @@ def _ui_set(config: RuntimeConfig, rest: str) -> RuntimeConfig:
         return replace(config, assume_yes=_parse_on_off(value, config.assume_yes))
     if key == "dry-run":
         return replace(config, dry_run=_parse_on_off(value, config.dry_run))
-    if key == "godot":
-        return replace(config, godot=None if value.lower() == "clear" else value)
     if key == "model":
         return replace(config, model=None if value.lower() == "clear" else value)
     if key == "profile":
@@ -1164,7 +1153,7 @@ def _ui_set(config: RuntimeConfig, rest: str) -> RuntimeConfig:
             print("max-steps 必须是整数")
             return config
         return replace(config, max_steps=max(1, steps))
-    print("支持的 set 项: strict, strict-schema, qa, assume-yes, dry-run, godot, model, api-key, base-url, provider, http-proxy, https-proxy, env, config, profile, output-style, max-steps")
+    print("支持的 set 项: strict, strict-schema, qa, assume-yes, dry-run, model, api-key, base-url, provider, http-proxy, https-proxy, env, config, profile, output-style, max-steps")
     return config
 
 
@@ -1244,7 +1233,6 @@ def _config_to_json(config: RuntimeConfig) -> dict[str, object]:
         "dry_run": config.dry_run,
         "assume_yes": config.assume_yes,
         "qa": config.qa,
-        "godot": config.godot,
         "strict_tools": config.strict_tools,
         "strict_schema": config.strict_schema,
         "max_steps": config.max_steps,

@@ -27,7 +27,7 @@ python -B -m compileall .\codex-skill-runtime-core
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'
-python -B .\codex-skill-runtime-core\core_cli.py --godot <godot-executable-or-dir> selftest --godot-project <godot-project> --live-strict-target README.md --live-qa-target <godot-project>
+python -B .\codex-skill-runtime-core\core_cli.py selftest --live-strict-target README.md --live-qa-target <project-path>
 ```
 
 结果：
@@ -165,7 +165,7 @@ SELFTEST_SUMMARY total=17 failed=0
 ```powershell
 python -B -m compileall codex_skill_runtime_tool\codex-skill-runtime-core codex_skill_runtime_tool\codex-skill-runtime-ui\backend
 python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env inspect
-python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env selftest --godot-project game_projects\marble_spiral_runtime
+python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env selftest
 ```
 
 结果：
@@ -191,7 +191,7 @@ GET /api/jobs
 结果：
 
 ```json
-{"ok":true,"target":"E:\\chuan_project\\claude_code_game_sutdio","capabilities":2,"jobs":0}
+{"ok":true,"target":"<workspace-root>","capabilities":2,"jobs":0}
 ```
 
 本轮新增验证点：

@@ -60,8 +60,6 @@ class SelfTester:
         project_root: Path,
         codex_executable: str,
         model: str | None,
-        godot: str | None,
-        godot_project: Path | None,
         live_qa_target: Path | None,
         live_strict_target: str | None = None,
         additional_dirs: list[Path] | None = None,
@@ -72,8 +70,6 @@ class SelfTester:
         self.project_root = self._prepare_fixture_root()
         self.codex_executable = codex_executable
         self.model = model
-        self.godot = godot
-        self.godot_project = godot_project.expanduser().resolve() if godot_project is not None else None
         self.live_qa_target = live_qa_target.expanduser().resolve() if live_qa_target is not None else None
         self.live_strict_target = live_strict_target
         self.results: list[Check] = []
@@ -94,7 +90,6 @@ class SelfTester:
             self._generic_platform_contract,
             self._question_pause_contract,
             self._project_memory_contract,
-            self._godot_plugin_contract,
             self._hook_decision_contract,
             self._external_layout_contract,
             self._mcp_bridge_contract,
@@ -111,7 +106,6 @@ class SelfTester:
             self._mcp_oauth_store_contract,
             self._bridge_voice_ide_contract,
             self._hook_shim_contract,
-            self._godot_contract,
             self._live_strict_contract,
             self._live_codex_qa_contract,
             self._claude_tree_clean,
@@ -148,7 +142,7 @@ class SelfTester:
         self._assert(len(agents) >= 45, f"expected >=45 agents, found {len(agents)}")
         for skill in ["prototype", "team-qa", "setup-engine", "dev-story"]:
             self._assert(skill in skills or f"ccgs:{skill}" in skills, f"missing skill {skill}")
-        for agent in ["prototyper", "qa-tester", "qa-lead", "godot-specialist"]:
+        for agent in ["prototyper", "qa-tester", "qa-lead"]:
             self._assert(agent in agents, f"missing agent {agent}")
         return f"skills={len(skills)} agents={len(agents)}"
 
@@ -191,11 +185,10 @@ class SelfTester:
             dry_run=True,
             assume_yes=True,
             qa_mode="required",
-            godot=self.godot,
         )
         result = runtime.run_skill(
             "/prototype",
-            "Godot tile map coin collection prototype --path engine --spike",
+            "Tile map coin collection prototype --path engine --spike",
         )
         self._assert(result.exit_code == 0, f"dry-run exit should be 0, got {result.exit_code}")
         self._assert(result.primary is not None, "primary dry-run missing")
@@ -217,7 +210,7 @@ class SelfTester:
 
         qa_prompt = result.tasks[0].prompt_path.read_text(encoding="utf-8")
         self._assert("EVIDENCE MATRIX" in qa_prompt, "QA prompt missing evidence requirement")
-        self._assert("HUD/UI text updates" in qa_prompt, "QA prompt missing HUD intermediate-state check")
+        self._assert("intermediate state updates" in qa_prompt, "QA prompt missing intermediate-state check")
         return f"session={result.session.id}"
 
     def _strict_dry_run_contract(self) -> str:
@@ -227,11 +220,10 @@ class SelfTester:
             dry_run=True,
             assume_yes=True,
             qa_mode="off",
-            godot=self.godot,
         )
         result = runtime.run_strict_skill(
             "/prototype",
-            "Godot tile map coin collection prototype --path engine --spike",
+            "Tile map coin collection prototype --path engine --spike",
             max_steps=2,
         )
         self._assert(result.exit_code == 0, f"strict dry-run exit should be 0, got {result.exit_code}")
@@ -254,7 +246,6 @@ class SelfTester:
             hooks=hooks,
             session=session,
             assume_yes=True,
-            godot=self.godot,
         )
 
         read = executor.execute({"tool": "read_file", "reason": "test read", "parameters": {"path": ".claude/skills/prototype/SKILL.md", "max_chars": 2000}})
@@ -599,20 +590,6 @@ class SelfTester:
         context = project_memory_context(self.project_root)
         self._assert("Runtime Project Memory" in context and "hero_idle" in context, "project memory context missing style or asset")
         return f"session={session.id}"
-
-    def _godot_plugin_contract(self) -> tuple[str, str] | str:
-        workspace_root = Path(__file__).resolve().parents[3]
-        plugin_root = workspace_root / "godot_tool_bridge_skill"
-        if not plugin_root.exists():
-            return ("SKIP", "godot_tool_bridge_skill plugin not present")
-        loader = SkillRepositoryLoader(plugin_root, bare=True)
-        skills = loader.list_skills()
-        self._assert("godot:godot-tool-bridge" in skills, "Godot bridge must be exposed as plugin skill")
-        skill = loader.load_skill("godot:godot-tool-bridge")
-        self._assert("scripts/godot_smoke.py" in skill.body, "Godot bridge skill must route through plugin script")
-        schema = (Path(__file__).resolve().parents[1] / "schemas" / "action-result.schema.json").read_text(encoding="utf-8")
-        self._assert("godot_smoke" not in schema, "Godot smoke must not be a runtime-core structured action")
-        return str(plugin_root)
 
     def _hook_decision_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-hook-decisions")
@@ -1159,7 +1136,6 @@ class SelfTester:
             dry_run=True,
             assume_yes=True,
             qa_mode="off",
-            godot=self.godot,
             output_style="explanatory",
             system_prompt="RUNTIME_CUSTOM_SYSTEM",
             append_system_prompt="RUNTIME_APPEND_SYSTEM",
@@ -1215,7 +1191,6 @@ class SelfTester:
             dry_run=True,
             assume_yes=True,
             qa_mode="off",
-            godot=self.godot,
         )
         resumed = runtime.resume_session(session.id, "continue probe")
         self._assert(resumed.exit_code == 0 and resumed.primary is not None, "dry-run resume failed")
@@ -1633,41 +1608,6 @@ class SelfTester:
         self._assert("Agent completed: qa-tester" in text, "agent completion audit missing")
         return f"session={session.id}"
 
-    def _godot_contract(self) -> tuple[str, str] | str:
-        if self.godot_project is None:
-            return ("SKIP", "no --godot-project supplied")
-        workspace_root = Path(__file__).resolve().parents[3]
-        script = workspace_root / "godot_tool_bridge_skill" / "scripts" / "godot_smoke.py"
-        self._assert(script.exists(), "Godot bridge plugin script missing")
-        session = RuntimeSession(self.project_root, "selftest-godot-plugin-live")
-        evidence_dir = session.path("godot-plugin-evidence")
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(script),
-                "--project",
-                str(self.godot_project),
-                "--godot",
-                str(self.godot or ""),
-                "--evidence-dir",
-                str(evidence_dir),
-            ],
-            cwd=str(self.project_root),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=120,
-        )
-        self._assert(completed.returncode == 0, f"Godot plugin smoke exit={completed.returncode}: {completed.stdout[-1000:]} {completed.stderr[-1000:]}")
-        data = json.loads(completed.stdout)
-        self._assert(data.get("status") == "PASS", "Godot plugin smoke did not PASS")
-        gameplay = evidence_dir / "gameplay-test.stdout.txt"
-        if gameplay.exists():
-            text = gameplay.read_text(encoding="utf-8", errors="replace")
-            self._assert("GAMEPLAY_TEST_OK" in text, "gameplay test did not report OK")
-        return f"session={session.id}"
-
     def _live_codex_qa_contract(self) -> tuple[str, str] | str:
         if self.live_qa_target is None:
             return ("SKIP", "no --live-qa-target supplied")
@@ -1677,13 +1617,11 @@ class SelfTester:
             dry_run=False,
             assume_yes=True,
             qa_mode="off",
-            godot=self.godot,
         )
-        godot_hint = f" Godot path: {self.godot}." if self.godot else ""
         prompt = (
-            f"Please QA this Godot project: {self.live_qa_target}."
-            f"{godot_hint} Run available headless tests or create a temporary probe outside the project if needed. "
-            "Focus on movement, wall blocking, coins, victory, restart, and immediate HUD Moves updates after every valid move. "
+            f"Please QA this project: {self.live_qa_target}. "
+            "Run available tests or create a temporary probe outside the project if needed. "
+            "Focus on the requested behavior, intermediate state updates, reset flows, and visible feedback consistency. "
             "Do not modify project files. Final answer must include VERDICT and EVIDENCE MATRIX."
         )
         result = runtime.run_agent("qa-tester", prompt)
@@ -1702,7 +1640,6 @@ class SelfTester:
             dry_run=False,
             assume_yes=True,
             qa_mode="off",
-            godot=self.godot,
         )
         result = runtime.run_strict_smoke(self.live_strict_target, max_steps=3)
         self._assert(result.exit_code == 0, f"strict smoke exit={result.exit_code}")

@@ -227,7 +227,7 @@ Runtime SHALL include a selftest command that exercises the critical CCGS equiva
 
 #### Scenario: Full live selftest
 
-- **WHEN** selftest is run with `--godot-project`, `--live-strict-target`, and `--live-qa-target`
+- **WHEN** selftest is run with `--live-strict-target` and `--live-qa-target`
 - **THEN** loader discovery, frontmatter routing, Task parsing, QA gates, dry-run contract,
   strict dry-run, tool executor, hook shim, Godot, live strict, live QA, and `.claude` clean
   checks all pass.

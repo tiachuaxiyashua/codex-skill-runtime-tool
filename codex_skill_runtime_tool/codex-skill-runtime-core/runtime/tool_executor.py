@@ -52,7 +52,6 @@ class ToolExecutor:
         hooks: HookDispatcher,
         session: RuntimeSession,
         assume_yes: bool,
-        godot: str | None = None,
         task_runner: TaskRunner | None = None,
         allowed_tools: Any = None,
         plugin_root: Path | None = None,
@@ -67,7 +66,6 @@ class ToolExecutor:
         self.hooks = hooks
         self.session = session
         self.assume_yes = assume_yes
-        self.godot = godot
         self.task_runner = task_runner
         self.plugin_root = plugin_root.resolve() if plugin_root is not None else None
         self.additional_dirs = additional_dirs or []

@@ -36,7 +36,7 @@ python -B -m compileall .\codex-skill-runtime-core
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'
-python -B .\codex-skill-runtime-core\core_cli.py --godot <godot-executable-or-dir> selftest --godot-project <godot-project> --live-strict-target README.md --live-qa-target <godot-project>
+python -B .\codex-skill-runtime-core\core_cli.py selftest --live-strict-target README.md --live-qa-target <project-path>
 ```
 
 结果：
@@ -140,7 +140,7 @@ PASS: external-layout-contract - external command/plugin/fork contracts matched
 PASS: mcp-bridge-contract - session=20260523-134722-selftest-mcp
 PASS: memory-compaction-contract - session=20260523-134733-selftest-memory
 PASS: hook-shim-contract - session=20260523-134733-selftest-hook
-SKIP: godot-contract - no --godot-project supplied
+SKIP: live-plugin-contract - no plugin live target supplied
 SKIP: live-strict-contract - no --live-strict-target supplied
 SKIP: live-codex-qa-contract - no --live-qa-target supplied
 PASS: claude-tree-clean - .claude diff is empty
@@ -159,7 +159,7 @@ SELFTEST_SUMMARY total=18 failed=0
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'
-python -B .\codex-skill-runtime-core\core_cli.py --godot <godot-executable-or-dir> selftest --godot-project <godot-project> --live-strict-target README.md --live-qa-target <godot-project>
+python -B .\codex-skill-runtime-core\core_cli.py selftest --live-strict-target README.md --live-qa-target <project-path>
 ```
 
 结果：
@@ -199,7 +199,7 @@ SELFTEST_SUMMARY total=18 failed=0
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'
-python -B .\codex-skill-runtime-core\core_cli.py --godot <godot-executable-or-dir> selftest --godot-project <godot-project> --live-strict-target README.md --live-qa-target <godot-project>
+python -B .\codex-skill-runtime-core\core_cli.py selftest --live-strict-target README.md --live-qa-target <project-path>
 ```
 
 结果：

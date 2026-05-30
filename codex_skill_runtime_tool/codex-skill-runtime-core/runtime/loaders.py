@@ -162,7 +162,7 @@ class SkillRepositoryLoader:
             "This is a discovery list only; full SKILL.md content is loaded only through the `skill` action.\n\n"
             "Invocation contract:\n"
             "- If the current user task or a loaded skill matches an entry, call the `skill` action before improvising.\n"
-            "- Invoke by fully qualified name when shown, for example `ccgs:start`, `art:2d-art-pipeline`, or `audio:game-audio-pipeline`.\n"
+            "- Invoke by fully qualified name when shown, for example `docs:write`, `ops:verify`, or `team:review`.\n"
             "- Do not invoke skills whose full content is already present in the current turn.\n"
             "- A loaded skill may invoke another skill through the same `skill` action; this is nested skill invocation.\n\n"
             f"Available skills:\n\n{body}"
@@ -218,17 +218,20 @@ class SkillRepositoryLoader:
             self.layout.docs_dir / "technical-preferences.md",
             self.layout.docs_dir / "coding-standards.md",
             self.layout.docs_dir / "hooks-reference.md",
-            self.layout.docs_dir / "templates" / "prototype-report.md",
         ]
         return [path for path in candidates if path.exists()]
 
     def settings_candidates(self) -> list[Path]:
-        candidates = [
-            _claude_home() / "settings.json",
-            _managed_claude_dir() / "settings.json",
+        candidates = []
+        if not self.bare:
+            candidates.extend([
+                _claude_home() / "settings.json",
+                _managed_claude_dir() / "settings.json",
+            ])
+        candidates.extend([
             self.layout.settings_path,
             self.layout.root_hooks_path,
-        ]
+        ])
         for root in self.additional_dirs:
             candidates.extend([root / ".claude" / "settings.json", root / "hooks" / "hooks.json"])
         for plugin in self.plugin_layouts():

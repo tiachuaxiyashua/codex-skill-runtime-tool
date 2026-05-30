@@ -4,6 +4,26 @@
 
 ## 启动
 
+推荐使用工程内的一键脚本：
+
+```powershell
+.\codex_skill_runtime_tool\start-runtime.ps1
+```
+
+如果是双击启动，可以运行：
+
+```text
+codex_skill_runtime_tool\start-runtime.bat
+```
+
+脚本会读取：
+
+```text
+codex_skill_runtime_tool\config\skill-runtime.env
+```
+
+并检查 Codex CLI、Codex API key、Godot 路径、Forge/A1111、ComfyUI，然后启动通用 Web UI。
+
 在工程根目录运行：
 
 ```powershell
@@ -27,6 +47,21 @@ codex_skill_runtime_tool\config\skill-runtime.env
 ```powershell
 python -B codex_skill_runtime_tool\runtime-ui.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env --port 8765
 ```
+
+只检查依赖、不启动 UI：
+
+```powershell
+.\codex_skill_runtime_tool\start-runtime.ps1 -CheckOnly
+```
+
+如果 Forge 或 ComfyUI 没有启动，脚本默认只会报告不可达。需要让脚本自动启动外部程序时，在 `skill-runtime.env` 中配置：
+
+```env
+SKILL_RUNTIME_START_FORGE_CMD=<启动 Forge 的 PowerShell 命令>
+SKILL_RUNTIME_START_COMFYUI_CMD=<启动 ComfyUI 的 PowerShell 命令>
+```
+
+这个设计是为了保持 runtime 通用：runtime 只知道能力端点和可选启动命令，不绑定 Stability Matrix、Forge、ComfyUI 或某个游戏项目的安装方式。
 
 ## UI 能看到什么
 

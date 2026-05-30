@@ -42,7 +42,7 @@ The original skill files are the source of truth. Do not rewrite or patch origin
 - Treat `AskUserQuestion` as a runtime pause. If a required answer is missing, ask one concise question and stop.
 - If the skill references supporting files by relative path, request a `read_file` action for the relevant file before relying on its contents.
 - If the skill tells you to invoke another skill, request a `skill` action with that skill name.
-- Use the Runtime SkillTool Registry in Repository Context to discover other loaded skills. Do not assume CCGS, art, audio, Godot, or any domain is built into the runtime core.
+- Use the Runtime SkillTool Registry in Repository Context to discover other loaded skills. Do not assume any domain-specific capability is built into the runtime core.
 - Store cross-skill continuity such as global visual/audio style, asset inventory, and durable project decisions in runtime project memory through `project_memory_write` or `asset_register` when strict tools are available.
 - {approval_policy}
 - For implementation work, produce actual files, commands run, and evidence. Do not claim testing unless you ran a command or clearly label it as not run.
@@ -347,23 +347,22 @@ def qa_prompt(
     return f"""# Codex Skill Runtime Required QA Pass
 
 You are the QA Tester subagent from the loaded skill repository's agent source.
-This pass exists because static skill conversion previously missed obvious gameplay bugs.
+This pass exists because static skill conversion previously missed obvious behavioral bugs.
 
 ## Hard Requirements
 
 - Do not fix bugs.
-- Inspect the target project and identify how to run it.
-- Run available smoke/gameplay tests if present.
-- For Godot projects, look for `project.godot`, `scripts/`, `scenes/`, and any test scripts.
+- Inspect the target project and identify how to run its most relevant verification commands.
+- Run available smoke, unit, integration, UI, end-to-end, or domain-specific tests if present.
+- Use loaded skill/plugin instructions and the runtime capability registry to find project-specific verification tools. Do not assume a specific engine or framework.
 - Specifically check intermediate state updates, not only terminal outcomes:
-  - movement input changes the player position
-  - blocked movement does not count as a valid move unless the game explicitly says it should
-  - empty-tile movement updates move count immediately
-  - HUD/UI text updates every time the underlying state changes
-  - coin collection updates coin count and move count
-  - restart resets player, coins, win state, and HUD
-  - win condition is reachable and not falsely triggered
-- If you cannot run the game, return `VERDICT: BLOCKED` and explain exactly why.
+  - each user-visible action changes the expected state immediately
+  - blocked or invalid actions do not mutate state unless the design explicitly says they should
+  - counters, status displays, logs, panels, or other UI text update every time the underlying state changes
+  - collection, inventory, score, resource, or progress values stay consistent after each step
+  - restart, reset, undo, retry, or reload flows restore the expected baseline
+  - success conditions are reachable and not falsely triggered
+- If you cannot run the target, return `VERDICT: BLOCKED` and explain exactly why.
 - Final answer must contain:
   - `VERDICT: PASS` / `PASS WITH WARNINGS` / `FAIL` / `BLOCKED`
   - `EVIDENCE MATRIX`

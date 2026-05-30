@@ -37,7 +37,7 @@ SELFTEST_SUMMARY total=27 failed=0
 命令：
 
 ```powershell
-python -B .\core_cli.py --godot <godot-executable-or-dir> --assume-yes --qa off selftest --godot-project <godot-project> --live-strict-target README.md --live-qa-target <godot-project>
+python -B .\core_cli.py --assume-yes --qa off selftest --live-strict-target README.md --live-qa-target <project-path>
 ```
 
 2026-05-24 15:44-15:54 的最终结果：

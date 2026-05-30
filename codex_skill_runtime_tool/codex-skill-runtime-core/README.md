@@ -64,7 +64,7 @@ python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtim
 完整自测：
 
 ```powershell
-python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env selftest --godot-project game_projects\marble_spiral_runtime
+python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env selftest
 ```
 
 本次基线结果：

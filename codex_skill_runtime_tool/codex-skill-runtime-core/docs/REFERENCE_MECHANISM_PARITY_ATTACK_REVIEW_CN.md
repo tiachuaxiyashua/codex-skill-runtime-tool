@@ -43,7 +43,7 @@ selftest: SELFTEST_SUMMARY total=18 failed=0
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'
-python -B .\codex-skill-runtime-core\core_cli.py --godot <godot-executable-or-dir> selftest --godot-project <godot-project> --live-strict-target README.md --live-qa-target <godot-project>
+python -B .\codex-skill-runtime-core\core_cli.py selftest --live-strict-target README.md --live-qa-target <project-path>
 ```
 
 结果：

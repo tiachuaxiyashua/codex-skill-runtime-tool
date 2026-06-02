@@ -10,4 +10,4 @@
 - [x] Update strict action schema and action-loop tool prompt.
 - [x] Add selftests for the new contracts.
 - [x] Run compile, selftest, OpenSpec validation, and hardcoding scan.
-- [ ] Commit and push.
+- [x] Commit and push.

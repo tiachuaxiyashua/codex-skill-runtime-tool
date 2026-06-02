@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -111,8 +112,10 @@ class SelfTester:
             self._compat_gap_contract,
             self._worker_registry_contract,
             self._task_tool_family_contract,
+            self._async_agent_background_contract,
             self._worker_scratchpad_contract,
             self._tool_search_contract,
+            self._reference_tool_gap_contract,
             self._plan_terminal_browser_contract,
             self._mcp_resource_contract,
             self._large_tool_result_contract,
@@ -1060,6 +1063,14 @@ class SelfTester:
             http_content = http_result.data.get("result", {}).get("content", [])
             self._assert(http_content and http_content[0].get("text") == "http:ok", "HTTP MCP bridge returned unexpected content")
 
+            searched_auth = executor.execute({"tool": "ToolSearch", "parameters": {"query": "authenticate authEcho", "limit": 20}})
+            auth_names = {row.get("name") for row in searched_auth.data.get("results", []) if isinstance(row, dict)}
+            self._assert("mcp__authEcho__authenticate" in auth_names, "ToolSearch did not expose MCP auth pseudo-tool")
+            auth_started = executor.execute({"tool": "McpAuth", "parameters": {"server": "authEcho"}})
+            self._assert(auth_started.status == "OK", f"McpAuth action failed: {auth_started.summary}")
+            dynamic_auth = executor.execute({"tool": "mcp__sseAuthEcho__authenticate", "parameters": {}})
+            self._assert(dynamic_auth.status == "OK", f"dynamic MCP auth pseudo-tool failed: {dynamic_auth.summary}")
+
             auth_result = executor.execute({"tool": "mcp__authEcho__echo", "parameters": {"arguments": {"text": "ok"}, "timeout": 10}})
             self._assert(auth_result.status == "OK", f"HTTP auth MCP bridge failed: {auth_result.summary}")
             auth_content = auth_result.data.get("result", {}).get("content", [])
@@ -1662,13 +1673,55 @@ class SelfTester:
         reloaded = WorkerRegistry(runner, session_dir=session.dir)
         described = reloaded.describe()
         self._assert(described and described[0].get("status") == "stopped", "persisted worker status was not restored")
+        persisted["workers"][0]["status"] = "running"
+        persisted["workers"][0]["turns"][-1]["output"] = ""
+        workers_path.write_text(json.dumps(persisted, ensure_ascii=False, indent=2), encoding="utf-8")
+        interrupted = WorkerRegistry(runner, session_dir=session.dir)
+        self._assert(interrupted.describe()[0].get("status") == "interrupted", "orphaned running worker was not marked interrupted")
         return f"session={session.id}"
 
     def _task_tool_family_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-task-tools")
+        executor = ToolExecutor(
+            project_root=self.project_root,
+            hooks=HookDispatcher([], self.project_root),
+            session=session,
+            assume_yes=True,
+        )
+        created = executor.execute({"tool": "TaskCreate", "parameters": {"subject": "Coverage task", "description": "produce task output"}})
+        self._assert(created.status == "OK" and created.data.get("task", {}).get("id") == "1", "TaskCreate did not create task-list item")
+        listed = executor.execute({"tool": "TaskList", "parameters": {}})
+        self._assert(listed.status == "OK" and listed.data.get("tasks"), "TaskList did not return task-list items")
+        got = executor.execute({"tool": "TaskGet", "parameters": {"taskId": "1"}})
+        self._assert(got.status == "OK" and got.data.get("task", {}).get("subject") == "Coverage task", "TaskGet did not read task-list item")
+        updated = executor.execute({"tool": "TaskUpdate", "parameters": {"taskId": "1", "status": "in_progress", "owner": "worker-a", "metadata": {"phase": "test"}}})
+        self._assert(updated.status == "OK" and "status" in updated.data.get("updatedFields", []), "TaskUpdate did not update task status")
+        created_blocker = executor.execute({"tool": "TaskCreate", "parameters": {"subject": "Blocker task", "description": "blocks coverage"}})
+        self._assert(created_blocker.status == "OK", "second TaskCreate failed")
+        blocked = executor.execute({"tool": "TaskUpdate", "parameters": {"taskId": "1", "addBlockedBy": ["2"]}})
+        self._assert(blocked.status == "OK", "TaskUpdate addBlockedBy failed")
+        listed_blocked = executor.execute({"tool": "TaskList", "parameters": {}})
+        first_task = next((item for item in listed_blocked.data.get("tasks", []) if item.get("id") == "1"), {})
+        self._assert("2" in first_task.get("blockedBy", []), "TaskList did not expose unresolved blocker")
+        deleted = executor.execute({"tool": "TaskUpdate", "parameters": {"taskId": "2", "status": "deleted"}})
+        self._assert(deleted.status == "OK" and "deleted" in deleted.data.get("updatedFields", []), "TaskUpdate deleted status failed")
+        allowed_executor = ToolExecutor(
+            project_root=self.project_root,
+            hooks=HookDispatcher([], self.project_root),
+            session=session,
+            assume_yes=False,
+            allowed_tools=["Task"],
+        )
+        allowed = allowed_executor.execute({"tool": "TaskCreate", "parameters": {"subject": "Allowed task", "description": "allowed task"}})
+        self._assert(allowed.status == "OK", "allowed-tools Task should permit TaskCreate family")
+        return f"session={session.id}"
+
+    def _async_agent_background_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-async-agent-background")
 
         def runner(agent: str, purpose: str, prompt: str, index: int) -> str:
-            return f"TASK_TOOL_OUTPUT:{agent}:{purpose}:{index}:{prompt[-20:]}"
+            time.sleep(0.2)
+            return f"ASYNC_TASK_MARKER:{agent}:{purpose}:{index}"
 
         registry = WorkerRegistry(runner, session_dir=session.dir)
         executor = ToolExecutor(
@@ -1678,28 +1731,16 @@ class SelfTester:
             assume_yes=True,
             worker_registry=registry,
         )
-        created = executor.execute({"tool": "TaskCreate", "parameters": {"agent": "worker", "purpose": "coverage", "prompt": "produce task output", "name": "coverage-worker"}})
-        self._assert(created.status == "OK" and created.data.get("worker_id") == "worker-001", "TaskCreate did not create worker")
-        listed = executor.execute({"tool": "TaskList", "parameters": {}})
-        self._assert(listed.status == "OK" and listed.data.get("workers"), "TaskList did not return workers")
-        got = executor.execute({"tool": "TaskGet", "parameters": {"task_id": "coverage-worker"}})
-        self._assert(got.status == "OK" and got.data.get("worker", {}).get("id") == "worker-001", "TaskGet did not resolve named worker")
-        output = executor.execute({"tool": "TaskOutput", "parameters": {"task_id": "worker-001", "full": True}})
-        self._assert(output.status == "OK" and "TASK_TOOL_OUTPUT" in output.data.get("output", ""), "TaskOutput did not return worker output")
-        updated = executor.execute({"tool": "TaskUpdate", "parameters": {"task_id": "worker-001", "status": "reviewing"}})
-        self._assert(updated.status == "OK" and updated.data.get("worker", {}).get("status") == "reviewing", "TaskUpdate did not update status")
-        stopped = executor.execute({"tool": "TaskStop", "parameters": {"task_id": "worker-001", "reason": "contract complete"}})
-        self._assert(stopped.status == "OK" and stopped.data.get("status") == "stopped", "TaskStop did not stop worker")
-        allowed_executor = ToolExecutor(
-            project_root=self.project_root,
-            hooks=HookDispatcher([], self.project_root),
-            session=session,
-            assume_yes=False,
-            worker_registry=registry,
-            allowed_tools=["Task"],
-        )
-        allowed = allowed_executor.execute({"tool": "TaskCreate", "parameters": {"agent": "worker", "purpose": "allowed", "prompt": "allowed task"}})
-        self._assert(allowed.status == "OK", "allowed-tools Task should permit TaskCreate family")
+        created = executor.execute({"tool": "Agent", "parameters": {"agent": "async-worker", "purpose": "async probe", "prompt": "run async", "name": "async-probe", "run_in_background": True}})
+        self._assert(created.status == "OK" and created.data.get("status") == "running", "Agent background mode should return a running worker")
+        non_blocking = executor.execute({"tool": "TaskOutput", "parameters": {"task_id": "async-probe", "block": False}})
+        self._assert(non_blocking.status == "OK" and non_blocking.data.get("retrieval_status") in {"not_ready", "success"}, "TaskOutput block=false did not return status")
+        slept = executor.execute({"tool": "Sleep", "parameters": {"seconds": 0.35, "max_seconds": 1}})
+        self._assert(slept.status == "OK", "Sleep tool failed")
+        output = executor.execute({"tool": "TaskOutput", "parameters": {"task_id": "async-probe", "full": True}})
+        self._assert(output.status == "OK" and "ASYNC_TASK_MARKER" in output.data.get("output", ""), "TaskOutput did not return async output")
+        persisted = json.loads((session.dir / "workers.json").read_text(encoding="utf-8", errors="replace"))
+        self._assert(persisted.get("workers") and persisted["workers"][0].get("status") == "completed", "async worker did not persist completed status")
         return f"session={session.id}"
 
     def _tool_search_contract(self) -> str:
@@ -1719,6 +1760,95 @@ class SelfTester:
         skill_result = executor.execute({"tool": "tool_search", "parameters": {"query": "prototype", "limit": 20}})
         self._assert(skill_result.status == "OK", "snake_case tool_search failed")
         self._assert(any(row.get("kind") == "skill" for row in skill_result.data.get("results", []) if isinstance(row, dict)), "ToolSearch did not include visible skills")
+        return f"session={session.id}"
+
+    def _reference_tool_gap_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-reference-tool-gap")
+        executor = ToolExecutor(
+            project_root=self.project_root,
+            hooks=HookDispatcher([], self.project_root),
+            session=session,
+            assume_yes=True,
+        )
+        discovered = executor.execute({"tool": "DiscoverSkills", "parameters": {"query": "prototype", "limit": 10}})
+        self._assert(discovered.status == "OK" and discovered.data.get("skills"), "DiscoverSkills did not return skills")
+
+        notebook_rel = Path(".selftest") / session.id / "probe.ipynb"
+        notebook = self.project_root / notebook_rel
+        notebook.parent.mkdir(parents=True, exist_ok=True)
+        notebook.write_text(
+            json.dumps({"cells": [{"cell_type": "markdown", "metadata": {}, "source": ["old"]}], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}),
+            encoding="utf-8",
+        )
+        edited = executor.execute(
+            {
+                "tool": "NotebookEdit",
+                "parameters": {
+                    "notebook_path": str(notebook_rel),
+                    "cell_number": 1,
+                    "edit_mode": "insert",
+                    "cell_type": "code",
+                    "source": "print('NOTEBOOK_MARKER')",
+                },
+            }
+        )
+        self._assert(edited.status == "OK" and edited.data.get("cell_count") == 2, "NotebookEdit insert failed")
+        loaded_notebook = json.loads(notebook.read_text(encoding="utf-8"))
+        self._assert(loaded_notebook["cells"][1]["cell_type"] == "code", "NotebookEdit did not write a code cell")
+
+        snip = executor.execute({"tool": "Snip", "parameters": {"path": "README.md", "start_line": 1, "end_line": 5}})
+        self._assert(snip.status == "OK" and snip.data.get("text"), "Snip failed")
+        user_file = executor.execute({"tool": "SendUserFile", "parameters": {"path": "README.md", "max_chars": 2000}})
+        self._assert(user_file.status == "OK" and "preview" in user_file.data, "SendUserFile failed")
+        review = executor.execute({"tool": "ReviewArtifact", "parameters": {"artifact": str(notebook_rel), "verdict": "PASS", "notes": "review marker"}})
+        self._assert(review.status == "OK", "ReviewArtifact failed")
+        brief = executor.execute({"tool": "SendUserMessage", "parameters": {"title": "probe", "content": "BRIEF_MARKER"}})
+        self._assert(brief.status == "OK", "Brief failed")
+        remote = executor.execute({"tool": "RemoteTrigger", "parameters": {"target": "fixture", "event": "probe", "payload": {"ok": True}}})
+        self._assert(remote.status == "OK", "RemoteTrigger failed")
+        structured = executor.execute({"tool": "StructuredOutput", "parameters": {"schema": {"type": "object"}, "value": {"ok": True}}})
+        self._assert(structured.status == "OK", "StructuredOutput failed")
+        workflow = executor.execute({"tool": "Workflow", "parameters": {"operation": "update", "id": "wf", "status": "running", "steps": [{"id": "a", "status": "done"}]}})
+        self._assert(workflow.status == "OK", "Workflow update failed")
+        team = executor.execute({"tool": "TeamCreate", "parameters": {"name": "qa-team", "members": ["qa", "dev"]}})
+        self._assert(team.status == "OK", "TeamCreate failed")
+        team_delete = executor.execute({"tool": "TeamDelete", "parameters": {"name": "qa-team"}})
+        self._assert(team_delete.status == "OK", "TeamDelete failed")
+        cron = executor.execute({"tool": "CronCreate", "parameters": {"name": "probe", "schedule": "once", "command": "echo probe"}})
+        self._assert(cron.status == "OK" and cron.data.get("job", {}).get("id"), "CronCreate failed")
+        cron_list = executor.execute({"tool": "CronList", "parameters": {}})
+        self._assert(cron_list.status == "OK" and cron_list.data.get("jobs"), "CronList failed")
+        cron_delete = executor.execute({"tool": "CronDelete", "parameters": {"job_id": cron.data["job"]["id"]}})
+        self._assert(cron_delete.status == "OK", "CronDelete failed")
+        fire_cron = executor.execute({"tool": "CronCreate", "parameters": {"name": "fire-probe", "schedule": "once", "prompt": "CRON_FIRE_MARKER", "recurring": False, "metadata": {"delay_seconds": 0.2}}})
+        self._assert(fire_cron.status == "OK", "CronCreate fire probe failed")
+        executor.execute({"tool": "Sleep", "parameters": {"seconds": 0.35, "max_seconds": 1}})
+        config = executor.execute({"tool": "Config", "parameters": {"operation": "inspect"}})
+        self._assert(config.status == "OK" and "settings" in config.data, "Config inspect failed")
+        monitor = executor.execute({"tool": "Monitor", "parameters": {"operation": "state"}})
+        self._assert(monitor.status == "OK" and "session" in monitor.data, "Monitor failed")
+        self._assert(any(item.get("prompt") == "CRON_FIRE_MARKER" for item in monitor.data.get("cron_fires", []) if isinstance(item, dict)), "Cron fire queue did not record fired prompt")
+        lsp = executor.execute({"tool": "LSP", "parameters": {"command": [sys.executable, "--version"], "timeout": 10}})
+        self._assert(lsp.status in {"OK", "ERROR"}, "LSP command did not execute")
+
+        repo = session.path("worktree-repo")
+        repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=str(repo), text=True, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.email", "runtime@example.test"], cwd=str(repo), text=True, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.name", "Runtime Test"], cwd=str(repo), text=True, capture_output=True, check=False)
+        (repo / "README.md").write_text("worktree probe", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=str(repo), text=True, capture_output=True, check=False)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=str(repo), text=True, capture_output=True, check=False)
+        worktree_executor = ToolExecutor(
+            project_root=repo,
+            hooks=HookDispatcher([], repo),
+            session=session,
+            assume_yes=True,
+        )
+        entered = worktree_executor.execute({"tool": "EnterWorktree", "parameters": {"name": "probe-worktree", "branch": "probe-branch", "base": "HEAD"}})
+        self._assert(entered.status == "OK" and Path(entered.data.get("path", "")).exists(), "EnterWorktree failed")
+        exited = worktree_executor.execute({"tool": "ExitWorktree", "parameters": {"path": entered.data["path"], "remove": True}})
+        self._assert(exited.status == "OK", "ExitWorktree failed")
         return f"session={session.id}"
 
     def _plan_terminal_browser_contract(self) -> str:

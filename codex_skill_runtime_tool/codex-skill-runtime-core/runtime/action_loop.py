@@ -268,16 +268,33 @@ Available tools:
 - powershell: parameters `command`, optional `timeout`
 - terminal_capture: parameters `command`, optional `shell`, optional `timeout`; persists stdout/stderr evidence
 - repl: parameters `language` (`python`), `code`
-- task or agent or task_create: parameters `agent`, `purpose`, `prompt`, optional `name`
-- task_get: parameters `to` or `worker_id` or `task_id`
-- task_list: optional `status`
-- task_output: parameters `to` or `worker_id` or `task_id`, optional `full`, optional `max_chars`
-- task_update: parameters `to` or `worker_id` or `task_id`, optional `message`, `status`, `purpose`, `name`
+- sleep: parameters `seconds`; bounded wait for polling
+- task or agent: parameters `agent` or `subagent_type`, `purpose`, `prompt`, optional `name`, optional `run_in_background`/`background` or `wait=false`
+- task_create: parameters `subject`, `description`, optional `activeForm`, `owner`, `metadata`; creates a task-list item, not a worker
+- task_get: parameters `taskId`; reads a task-list item
+- task_list: optional `status`; lists task-list items
+- task_output: parameters `to` or `worker_id` or `task_id`, optional `block` (default true), optional `timeout` milliseconds, optional `full`, optional `max_chars`; reads background worker/agent output
+- task_update: parameters `taskId`, optional `subject`, `description`, `activeForm`, `status`, `owner`, `addBlocks`, `addBlockedBy`, `metadata`
 - ask_user_question: parameters `question`, optional `options`, optional `default`
 - todo_write: parameters `items` list, or `todos` list
 - skill: parameters `name`, optional `arguments`; loads another model-invocable skill by name
+- discover_skills: optional `query`, `limit`, `model_only`; lists visible skills without loading full bodies
 - tool_search: parameters `query`, optional `limit`; searches runtime tools, visible skills, capabilities, and MCP servers
 - plan_mode: parameters `operation` enter/exit/verify plus plan/evidence fields; aliases EnterPlanMode/ExitPlanMode/VerifyPlanExecution also route here
+- config: parameters `operation` inspect/plugin_enable/plugin_disable
+- notebook_edit: parameters `notebook_path`, `cell_number`, `source`, optional `cell_type`, optional `edit_mode`
+- snip: parameters `path`, optional `start_line`, optional `end_line`
+- send_user_file: parameters `path`, optional `copy`; registers a user-provided file in session state
+- review_artifact: parameters `artifact` or `path`, optional `verdict`, optional `notes`
+- brief or SendUserMessage: parameters `title`, `content`; persists user-visible brief text
+- remote_trigger: records a generic remote trigger request
+- structured_output: records schema/value structured output
+- workflow: parameters `operation`, optional `id`/`name`, optional `status`, `steps`, `summary`
+- team_create/team_delete: parameters `name`, optional `members`, optional `purpose`
+- enter_worktree/exit_worktree: create or record exit/removal for a git worktree
+- cron_create/cron_list/cron_delete: persistent schedule records
+- monitor: reads current session/tree/worker/job state
+- lsp: parameters `command`; direct LSP command runner
 - project_memory_read: parameters optional `section`; reads runtime-owned global style, asset manifest, or project notes
 - project_memory_write: parameters `section`, `content`, optional `append`; writes runtime-owned global style or project notes
 - asset_register: parameters `asset` object; appends one generated or imported asset record to runtime-owned asset manifest
@@ -293,6 +310,7 @@ Available tools:
 - web_search: parameters `query`
 - web_browser: parameters `operation` open/click/find/current; provides a lightweight stateful browser
 - mcp: parameters `tool`, optional `arguments`; supports configured stdio, HTTP, SSE, and WebSocket MCP servers. Remote OAuth uses stored tokens, headers, headersHelper, authCommand/tokenCommand/refreshCommand, and explicit BLOCKED results when user authorization material is still missing.
+- mcp_auth: parameters `server`, optional `callback_url` or `code`; starts or completes OAuth for a configured MCP server. Dynamic `mcp__<server>__authenticate` actions are also accepted.
 - list_mcp_resources: optional `server`, optional `cursor`
 - read_mcp_resource: parameters `uri`, optional `server`
 - mcp_elicitation: parameters `operation` request/respond/list; records elicitation pause/answer lifecycle

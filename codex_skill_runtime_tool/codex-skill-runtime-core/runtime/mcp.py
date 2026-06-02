@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 
 from .loaders import SkillRepositoryLoader
-from .mcp_oauth import refresh_oauth_token, start_oauth_authorization, stored_oauth_headers, token_record_from_auth_output
+from .mcp_oauth import complete_oauth_authorization, refresh_oauth_token, start_oauth_authorization, stored_oauth_headers, token_record_from_auth_output
 from .secure_store import SecureTokenStore
 
 
@@ -78,6 +78,63 @@ def call_mcp_tool(
     if transport == "websocket":
         return _call_websocket_mcp_tool(project_root=project_root, server=server, tool_name=tool_name, arguments=arguments, timeout=timeout)
     raise MCPBridgeError(f"MCP server `{server.name}` has unsupported transport `{transport}`.")
+
+
+def authenticate_mcp_server(
+    *,
+    project_root: Path,
+    server_name: str,
+    callback_url: str | None = None,
+    code: str | None = None,
+    extra_servers: list[MCPServerConfig] | None = None,
+    additional_dirs: list[Path] | None = None,
+) -> dict[str, Any]:
+    server = _resolve_server(
+        project_root=project_root,
+        server_name=server_name,
+        extra_servers=extra_servers,
+        additional_dirs=additional_dirs,
+    )
+    transport = _server_transport(server.config)
+    if transport in {"http", "sse", "websocket"}:
+        server_url = _remote_url(
+            server.config,
+            "websocket" if transport == "websocket" else transport,
+            project_root=project_root,
+            plugin_root=server.plugin_root,
+        )
+    else:
+        server_url = str(server.config.get("url") or server.config.get("uri") or "")
+
+    if callback_url or code:
+        record = complete_oauth_authorization(
+            project_root=project_root,
+            server_name=server.name,
+            config=server.config,
+            callback_url=callback_url,
+            code=code,
+        )
+        return {
+            "server": server.name,
+            "transport": transport,
+            "status": "authenticated",
+            "key": record.key,
+            "expires_at": record.expires_at,
+        }
+
+    result = start_oauth_authorization(
+        project_root=project_root,
+        server_name=server.name,
+        config=server.config,
+        plugin_root=server.plugin_root,
+        server_url=server_url,
+    )
+    return {
+        "server": server.name,
+        "transport": transport,
+        "tool": f"mcp__{server.name}__authenticate",
+        "result": result,
+    }
 
 
 def call_mcp_method(

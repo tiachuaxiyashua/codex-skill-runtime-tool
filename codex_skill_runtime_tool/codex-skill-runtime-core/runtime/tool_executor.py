@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import threading
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -20,13 +21,33 @@ from .hooks import HookDispatcher, PermissionDecision, hook_block_reason, hook_u
 from .ide import IDESelection, ide_context, run_lsp_command, write_ide_diagnostics, write_ide_selection
 from .large_results import compact_tool_result
 from .loaders import SkillRepositoryLoader
-from .mcp import MCPBridgeError, MCPServerConfig, call_mcp_tool, list_mcp_resources, read_mcp_resource
+from .mcp import MCPBridgeError, MCPServerConfig, authenticate_mcp_server, call_mcp_tool, list_mcp_resources, read_mcp_resource
 from .memory import agent_memory_context, read_project_memory, record_asset, write_agent_memory, write_project_memory
 from .plan_state import enter_plan_mode, exit_plan_mode, verify_plan_execution
 from .prompts import render_markdown_body
 from .questions import record_pending_question
+from .reference_tools import (
+    append_session_record,
+    bounded_sleep,
+    create_cron,
+    create_worktree,
+    delete_cron,
+    delete_named_state,
+    edit_notebook,
+    exit_worktree,
+    list_cron,
+    load_named_state,
+    register_user_file,
+    snip_file,
+    start_cron_timer,
+    upsert_named_state,
+)
 from .session import RuntimeSession
 from .session_memory import maybe_update_session_memory
+from .task_list import create_task as create_list_task
+from .task_list import get_task as get_list_task
+from .task_list import list_tasks as list_list_tasks
+from .task_list import update_task as update_list_task
 from .terminal import persist_terminal_capture, run_powershell, run_python_repl, run_terminal_capture
 from .tool_search import search_runtime_tools
 from .tool_transcript import append_tool_transcript
@@ -115,9 +136,10 @@ class ToolExecutor:
             "powershell": self._powershell,
             "terminal_capture": self._terminal_capture,
             "repl": self._repl,
+            "sleep": self._sleep,
             "task": self._task,
             "agent": self._task,
-            "task_create": self._task,
+            "task_create": self._task_create,
             "task_get": self._task_get,
             "task_list": self._task_list,
             "task_output": self._task_output,
@@ -125,16 +147,36 @@ class ToolExecutor:
             "ask_user_question": self._ask_user_question,
             "todo_write": self._todo_write,
             "skill": self._skill,
+            "discover_skills": self._discover_skills,
             "tool_search": self._tool_search,
             "plan_mode": self._plan_mode,
+            "config": self._config,
             "project_memory_read": self._project_memory_read,
             "project_memory_write": self._project_memory_write,
             "asset_register": self._asset_register,
             "capability_list": self._capability_list,
+            "notebook_edit": self._notebook_edit,
+            "snip": self._snip,
+            "send_user_file": self._send_user_file,
+            "review_artifact": self._review_artifact,
+            "brief": self._brief,
+            "remote_trigger": self._remote_trigger,
+            "structured_output": self._structured_output,
+            "workflow": self._workflow,
+            "team_create": self._team_create,
+            "team_delete": self._team_delete,
+            "enter_worktree": self._enter_worktree,
+            "exit_worktree": self._exit_worktree,
+            "cron_create": self._cron_create,
+            "cron_list": self._cron_list,
+            "cron_delete": self._cron_delete,
+            "monitor": self._monitor,
+            "lsp": self._lsp,
             "web_fetch": self._web_fetch,
             "web_search": self._web_search,
             "web_browser": self._web_browser,
             "mcp": self._mcp,
+            "mcp_auth": self._mcp_auth,
             "list_mcp_resources": self._list_mcp_resources,
             "read_mcp_resource": self._read_mcp_resource,
             "mcp_elicitation": self._mcp_elicitation,
@@ -461,6 +503,11 @@ class ToolExecutor:
             },
         )
 
+    def _sleep(self, parameters: dict[str, Any]) -> ToolResult:
+        seconds = float(parameters.get("seconds", parameters.get("duration", 0)))
+        result = bounded_sleep(seconds, max_seconds=float(parameters.get("max_seconds", 60)))
+        return ToolResult("sleep", "OK", f"Slept {result['slept_seconds']} second(s)", result)
+
     def _task(self, parameters: dict[str, Any]) -> ToolResult:
         if self.worker_registry is None and self.task_runner is None:
             raise ToolExecutionError("task runner is not configured")
@@ -468,70 +515,132 @@ class ToolExecutor:
         prompt = str(parameters.get("prompt", parameters.get("purpose", "")))
         purpose = str(parameters.get("purpose", "Runtime Task action"))
         name = parameters.get("name")
+        background = bool(parameters.get("run_in_background", parameters.get("background", False))) or parameters.get("wait") is False
         if self.worker_registry is not None:
-            record = self.worker_registry.spawn(
-                agent=agent,
-                purpose=purpose,
-                prompt=prompt,
-                name=str(name) if name else None,
+            record = (
+                self.worker_registry.spawn_async(
+                    agent=agent,
+                    purpose=purpose,
+                    prompt=prompt,
+                    name=str(name) if name else None,
+                )
+                if background
+                else self.worker_registry.spawn(
+                    agent=agent,
+                    purpose=purpose,
+                    prompt=prompt,
+                    name=str(name) if name else None,
+                )
             )
+            verb = "started" if background else "completed"
             return ToolResult(
                 "task",
                 "OK",
-                f"Task {agent} completed as {record.id}",
+                f"Agent {agent} {verb} as {record.id}",
                 {
                     "agent": agent,
                     "worker_id": record.id,
+                    "task_id": record.id,
                     "name": record.name,
                     "status": record.status,
                     "output": record.latest_output,
                     "send_message_hint": f"Use SendMessage with to='{record.id}' to continue this worker.",
+                    "task_output_hint": f"Use TaskOutput with task_id='{record.id}' to poll this worker.",
                 },
             )
         output = self.task_runner(agent, purpose, prompt) if self.task_runner is not None else ""
-        return ToolResult("task", "OK", f"Task {agent} completed", {"agent": agent, "output": output})
+        return ToolResult("task", "OK", f"Agent {agent} completed", {"agent": agent, "output": output})
+
+    def _task_create(self, parameters: dict[str, Any]) -> ToolResult:
+        subject = str(parameters.get("subject") or parameters.get("title") or parameters.get("name") or parameters.get("purpose") or "").strip()
+        description = str(parameters.get("description") or parameters.get("prompt") or parameters.get("content") or "").strip()
+        if not subject:
+            raise ToolExecutionError("TaskCreate requires `subject`")
+        task = create_list_task(
+            self.session.dir,
+            subject=subject,
+            description=description,
+            active_form=str(parameters.get("activeForm") or parameters.get("active_form") or ""),
+            owner=str(parameters.get("owner") or ""),
+            metadata=parameters.get("metadata") if isinstance(parameters.get("metadata"), dict) else {},
+        )
+        return ToolResult(
+            "task_create",
+            "OK",
+            f"Created task #{task['id']}: {task['subject']}",
+            {"task": {"id": task["id"], "subject": task["subject"]}},
+        )
 
     def _task_get(self, parameters: dict[str, Any]) -> ToolResult:
-        if self.worker_registry is None:
-            raise ToolExecutionError("worker registry is not configured")
-        key = _task_key(parameters)
-        record = self.worker_registry.get(key)
-        return ToolResult("task_get", "OK", f"Loaded worker {record.id}", {"worker": asdict(record)})
+        task_id = _list_task_id(parameters)
+        if not task_id:
+            raise ToolExecutionError("TaskGet requires `taskId`")
+        task = get_list_task(self.session.dir, task_id)
+        if task is None:
+            return ToolResult("task_get", "OK", "Task not found", {"task": None})
+        return ToolResult("task_get", "OK", f"Loaded task #{task_id}", {"task": task})
 
     def _task_list(self, parameters: dict[str, Any]) -> ToolResult:
-        if self.worker_registry is None:
-            raise ToolExecutionError("worker registry is not configured")
-        rows = self.worker_registry.describe()
+        tasks = list_list_tasks(self.session.dir)
+        resolved = {str(task.get("id")) for task in tasks if task.get("status") == "completed"}
+        rows = []
         status_filter = str(parameters.get("status") or "").strip()
-        if status_filter:
-            rows = [row for row in rows if row.get("status") == status_filter]
-        return ToolResult("task_list", "OK", f"Listed {len(rows)} worker task(s)", {"workers": rows})
+        for task in tasks:
+            if status_filter and task.get("status") != status_filter:
+                continue
+            blocked_by = [item for item in task.get("blockedBy", []) if item not in resolved] if isinstance(task.get("blockedBy"), list) else []
+            rows.append(
+                {
+                    "id": task.get("id"),
+                    "subject": task.get("subject", ""),
+                    "status": task.get("status", "pending"),
+                    "owner": task.get("owner", ""),
+                    "blockedBy": blocked_by,
+                }
+            )
+        return ToolResult("task_list", "OK", f"Listed {len(rows)} task(s)", {"tasks": rows})
+
+    def _task_update(self, parameters: dict[str, Any]) -> ToolResult:
+        task_id = _list_task_id(parameters)
+        if not task_id:
+            raise ToolExecutionError("TaskUpdate requires `taskId`")
+        result = update_list_task(
+            self.session.dir,
+            task_id=task_id,
+            subject=str(parameters["subject"]) if "subject" in parameters else None,
+            description=str(parameters["description"]) if "description" in parameters else None,
+            active_form=str(parameters.get("activeForm") or parameters.get("active_form")) if ("activeForm" in parameters or "active_form" in parameters) else None,
+            status=str(parameters["status"]) if "status" in parameters else None,
+            owner=str(parameters["owner"]) if "owner" in parameters else None,
+            add_blocks=[str(item) for item in parameters.get("addBlocks", parameters.get("add_blocks", []))] if isinstance(parameters.get("addBlocks", parameters.get("add_blocks", [])), list) else None,
+            add_blocked_by=[str(item) for item in parameters.get("addBlockedBy", parameters.get("add_blocked_by", []))] if isinstance(parameters.get("addBlockedBy", parameters.get("add_blocked_by", [])), list) else None,
+            metadata=parameters.get("metadata") if isinstance(parameters.get("metadata"), dict) else None,
+        )
+        status = "OK" if result.get("success") else "BLOCKED"
+        return ToolResult("task_update", status, str(result.get("error") or f"Updated task #{task_id}"), result)
 
     def _task_output(self, parameters: dict[str, Any]) -> ToolResult:
         if self.worker_registry is None:
             raise ToolExecutionError("worker registry is not configured")
         key = _task_key(parameters)
+        block = _bool_parameter(parameters.get("block", parameters.get("wait", True)), default=True)
+        timeout_ms = int(parameters.get("timeout", 30000))
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        if block:
+            while time.monotonic() < deadline:
+                record = self.worker_registry.get(key)
+                if record.status not in {"running", "pending"}:
+                    break
+                time.sleep(0.1)
         output = self.worker_registry.output(
             key,
             full=bool(parameters.get("full", False)),
             max_chars=int(parameters.get("max_chars", 20000)),
         )
-        return ToolResult("task_output", "OK", f"Loaded output for {key}", output)
-
-    def _task_update(self, parameters: dict[str, Any]) -> ToolResult:
-        if self.worker_registry is None:
-            raise ToolExecutionError("worker registry is not configured")
-        key = _task_key(parameters)
-        prompt = str(parameters.get("message") or parameters.get("prompt") or parameters.get("content") or "")
-        name = parameters.get("name")
-        record = self.worker_registry.update(
-            to=key,
-            prompt=prompt,
-            status=str(parameters.get("status") or ""),
-            purpose=str(parameters.get("purpose") or ""),
-            name=str(name) if name is not None else None,
-        )
-        return ToolResult("task_update", "OK", f"Updated worker {record.id}", {"worker": asdict(record)})
+        worker = output.get("worker") if isinstance(output, dict) else {}
+        worker_status = str(worker.get("status") if isinstance(worker, dict) else "")
+        retrieval_status = "success" if worker_status not in {"running", "pending"} else ("timeout" if block else "not_ready")
+        return ToolResult("task_output", "OK", f"Loaded output for {key}", {"retrieval_status": retrieval_status, **output})
 
     def _send_message(self, parameters: dict[str, Any]) -> ToolResult:
         if self.worker_registry is None:
@@ -690,6 +799,22 @@ class ToolExecutor:
             },
         )
 
+    def _discover_skills(self, parameters: dict[str, Any]) -> ToolResult:
+        query = str(parameters.get("query") or "").strip().lower()
+        model_only = bool(parameters.get("model_only", True))
+        touched = parameters.get("touched_paths")
+        touched_paths = [str(item) for item in touched] if isinstance(touched, list) else []
+        loader = SkillRepositoryLoader(self.project_root, additional_dirs=self.additional_dirs)
+        listings = loader.skill_listings(touched_paths=touched_paths, model_only=model_only)
+        rows = [item.__dict__ | {"path": str(item.path)} for item in listings]
+        if query:
+            rows = [
+                row for row in rows
+                if query in str(row.get("name", "")).lower() or query in str(row.get("description", "")).lower()
+            ]
+        limit = int(parameters.get("limit", 80))
+        return ToolResult("discover_skills", "OK", f"Discovered {len(rows[:limit])} skill(s)", {"skills": rows[:limit], "total": len(rows)})
+
     def _tool_search(self, parameters: dict[str, Any]) -> ToolResult:
         query = str(parameters.get("query") or parameters.get("q") or "")
         limit = int(parameters.get("limit", 8))
@@ -723,6 +848,210 @@ class ToolExecutor:
             self.session.event("plan.verify", "Verified runtime plan execution", state=state)
             return ToolResult("plan_mode", status, "Plan verification passed" if status == "OK" else "Plan verification incomplete", state)
         raise ToolExecutionError(f"unknown plan_mode operation: {operation}")
+
+    def _config(self, parameters: dict[str, Any]) -> ToolResult:
+        operation = _operation(parameters)
+        loader = SkillRepositoryLoader(self.project_root, additional_dirs=self.additional_dirs)
+        if operation in {"load", "get", "inspect"}:
+            return ToolResult(
+                "config",
+                "OK",
+                "Loaded runtime configuration summary",
+                {
+                    "project_root": str(self.project_root),
+                    "additional_dirs": [str(path) for path in self.additional_dirs],
+                    "plugin_root": str(self.plugin_root) if self.plugin_root else "",
+                    "settings": [str(path) for path in loader.settings_candidates()],
+                    "plugins": loader.plugin_statuses(),
+                    "preapproved_tools": sorted(self.preapproved_tools),
+                    "agent_name": self.agent_name,
+                    "agent_memory_scope": self.agent_memory_scope or "",
+                },
+            )
+        if operation in {"plugin_enable", "plugin_disable"}:
+            from .plugins import set_plugin_enabled
+
+            name = _required(parameters, "name")
+            root = parameters.get("root") or parameters.get("plugin_root")
+            state = set_plugin_enabled(self.project_root, name=name, root=str(root) if root else None, enabled=operation == "plugin_enable")
+            return ToolResult("config", "OK", f"Plugin {name} {'enabled' if operation == 'plugin_enable' else 'disabled'}", {"state": state})
+        raise ToolExecutionError(f"unknown config operation: {operation}")
+
+    def _notebook_edit(self, parameters: dict[str, Any]) -> ToolResult:
+        path = self._resolve_write_path(str(parameters.get("notebook_path") or parameters.get("path") or ""))
+        result = edit_notebook(
+            path,
+            cell_number=int(parameters.get("cell_number", parameters.get("index", 0))),
+            source=str(parameters.get("source") or parameters.get("content") or ""),
+            cell_type=str(parameters.get("cell_type") or "code"),
+            edit_mode=str(parameters.get("edit_mode") or parameters.get("mode") or "replace"),
+        )
+        self.session.add_artifact(path, metadata={"tool": "notebook_edit", **result})
+        return ToolResult("notebook_edit", "OK", f"Edited notebook {path}", result)
+
+    def _snip(self, parameters: dict[str, Any]) -> ToolResult:
+        path = self._resolve_read_path(str(parameters.get("path") or parameters.get("file_path") or ""))
+        result = snip_file(
+            path,
+            start_line=int(parameters.get("start_line", parameters.get("line", 1))),
+            end_line=_optional_int(parameters.get("end_line")),
+            max_lines=int(parameters.get("max_lines", 200)),
+        )
+        return ToolResult("snip", "OK", f"Snipped {path}", result)
+
+    def _send_user_file(self, parameters: dict[str, Any]) -> ToolResult:
+        path = self._resolve_read_path(str(parameters.get("path") or parameters.get("file_path") or ""))
+        result = register_user_file(
+            self.session.dir,
+            path,
+            copy=bool(parameters.get("copy", False)),
+            max_chars=int(parameters.get("max_chars", 12000)),
+        )
+        self.session.add_artifact(result["path"], metadata={"tool": "send_user_file", "source": result["source"]})
+        return ToolResult("send_user_file", "OK", f"Registered user file {path}", result)
+
+    def _review_artifact(self, parameters: dict[str, Any]) -> ToolResult:
+        record = {
+            "artifact": str(parameters.get("artifact") or parameters.get("path") or ""),
+            "verdict": str(parameters.get("verdict") or parameters.get("status") or ""),
+            "notes": str(parameters.get("notes") or parameters.get("review") or ""),
+            "metadata": parameters.get("metadata") if isinstance(parameters.get("metadata"), dict) else {},
+        }
+        path = append_session_record(self.session.dir, "artifact-reviews.jsonl", record)
+        return ToolResult("review_artifact", "OK", "Recorded artifact review", {"path": str(path), "review": record})
+
+    def _brief(self, parameters: dict[str, Any]) -> ToolResult:
+        record = {
+            "title": str(parameters.get("title") or parameters.get("name") or "brief"),
+            "content": str(parameters.get("content") or parameters.get("text") or parameters.get("summary") or ""),
+            "metadata": parameters.get("metadata") if isinstance(parameters.get("metadata"), dict) else {},
+        }
+        path = append_session_record(self.session.dir, "briefs.jsonl", record)
+        return ToolResult("brief", "OK", f"Recorded brief {record['title']}", {"path": str(path), "brief": record})
+
+    def _remote_trigger(self, parameters: dict[str, Any]) -> ToolResult:
+        record = {
+            "target": str(parameters.get("target") or parameters.get("name") or ""),
+            "event": str(parameters.get("event") or parameters.get("operation") or parameters.get("action") or "trigger"),
+            "payload": parameters.get("payload") if isinstance(parameters.get("payload"), dict) else {},
+            "metadata": parameters.get("metadata") if isinstance(parameters.get("metadata"), dict) else {},
+        }
+        path = append_session_record(self.session.dir, "remote-triggers.jsonl", record)
+        return ToolResult("remote_trigger", "OK", "Recorded remote trigger request", {"path": str(path), "trigger": record})
+
+    def _structured_output(self, parameters: dict[str, Any]) -> ToolResult:
+        record = {
+            "schema": parameters.get("schema") if isinstance(parameters.get("schema"), dict) else {},
+            "value": parameters.get("value", parameters.get("output", parameters.get("content", ""))),
+            "metadata": parameters.get("metadata") if isinstance(parameters.get("metadata"), dict) else {},
+        }
+        path = append_session_record(self.session.dir, "structured-output.jsonl", record)
+        return ToolResult("structured_output", "OK", "Recorded structured output", {"path": str(path), "output": record})
+
+    def _workflow(self, parameters: dict[str, Any]) -> ToolResult:
+        operation = _operation(parameters)
+        key = str(parameters.get("id") or parameters.get("name") or "default")
+        if operation in {"load", "list", "get"}:
+            return ToolResult("workflow", "OK", "Loaded workflow state", load_named_state(self.session.dir, "workflows.json"))
+        if operation in {"delete", "remove"}:
+            deleted = delete_named_state(self.session.dir, "workflows.json", key=key)
+            return ToolResult("workflow", "OK", f"Deleted workflow {key}", {"deleted": deleted})
+        value = {
+            "status": str(parameters.get("status") or operation or "updated"),
+            "steps": parameters.get("steps") if isinstance(parameters.get("steps"), list) else [],
+            "summary": str(parameters.get("summary") or parameters.get("content") or ""),
+            "metadata": parameters.get("metadata") if isinstance(parameters.get("metadata"), dict) else {},
+        }
+        item = upsert_named_state(self.session.dir, "workflows.json", key=key, value=value)
+        return ToolResult("workflow", "OK", f"Updated workflow {key}", {"id": key, "workflow": item})
+
+    def _team_create(self, parameters: dict[str, Any]) -> ToolResult:
+        name = str(parameters.get("name") or parameters.get("team") or "default")
+        members = parameters.get("members")
+        item = upsert_named_state(
+            self.session.dir,
+            "teams.json",
+            key=name,
+            value={
+                "members": [str(member) for member in members] if isinstance(members, list) else [],
+                "purpose": str(parameters.get("purpose") or ""),
+                "metadata": parameters.get("metadata") if isinstance(parameters.get("metadata"), dict) else {},
+            },
+        )
+        return ToolResult("team_create", "OK", f"Created team {name}", {"name": name, "team": item})
+
+    def _team_delete(self, parameters: dict[str, Any]) -> ToolResult:
+        name = str(parameters.get("name") or parameters.get("team") or "default")
+        deleted = delete_named_state(self.session.dir, "teams.json", key=name)
+        return ToolResult("team_delete", "OK", f"Deleted team {name}", {"name": name, "deleted": deleted})
+
+    def _enter_worktree(self, parameters: dict[str, Any]) -> ToolResult:
+        result = create_worktree(
+            self.project_root,
+            self.session.dir,
+            name=str(parameters.get("name") or ""),
+            branch=str(parameters.get("branch") or ""),
+            base=str(parameters.get("base") or parameters.get("from") or ""),
+        )
+        return ToolResult("enter_worktree", "OK", f"Created worktree {result['path']}", result)
+
+    def _exit_worktree(self, parameters: dict[str, Any]) -> ToolResult:
+        result = exit_worktree(
+            self.project_root,
+            self.session.dir,
+            path=str(parameters.get("path") or parameters.get("worktree") or self.project_root),
+            remove=bool(parameters.get("remove", False)),
+        )
+        return ToolResult("exit_worktree", "OK", "Updated worktree state", result)
+
+    def _cron_create(self, parameters: dict[str, Any]) -> ToolResult:
+        job = create_cron(
+            self.session.dir,
+            name=str(parameters.get("name") or "runtime-cron"),
+            schedule=str(parameters.get("schedule") or parameters.get("cron") or ""),
+            command=str(parameters.get("command") or parameters.get("prompt") or ""),
+            metadata=parameters.get("metadata") if isinstance(parameters.get("metadata"), dict) else {},
+            recurring=bool(parameters.get("recurring", True)),
+            durable=bool(parameters.get("durable", False)),
+        )
+        start_cron_timer(self.session.dir, job)
+        return ToolResult("cron_create", "OK", f"Created cron {job['id']}", {"job": job})
+
+    def _cron_list(self, parameters: dict[str, Any]) -> ToolResult:
+        jobs = list_cron(self.session.dir)
+        return ToolResult("cron_list", "OK", f"Listed {len(jobs)} cron job(s)", {"jobs": jobs})
+
+    def _cron_delete(self, parameters: dict[str, Any]) -> ToolResult:
+        job_id = str(parameters.get("id") or parameters.get("job_id") or "").strip()
+        if not job_id:
+            raise ToolExecutionError("cron_delete requires `id` or `job_id`")
+        deleted = delete_cron(self.session.dir, job_id=job_id)
+        return ToolResult("cron_delete", "OK", f"Deleted cron {job_id}", {"deleted": deleted})
+
+    def _monitor(self, parameters: dict[str, Any]) -> ToolResult:
+        operation = _operation(parameters)
+        data: dict[str, Any] = {
+            "session": _load_json_file(self.session.dir / "session-state.json"),
+            "task_tree": _load_json_file(self.session.dir / "task-tree.json"),
+            "workers": _load_json_file(self.session.dir / "workers.json"),
+            "tasks": _load_json_file(self.session.dir / "tasks.json"),
+            "cron": _load_json_file(self.session.dir / "cron.json"),
+            "cron_fires": _load_jsonl_file(self.session.dir / "cron-fires.jsonl"),
+            "jobs": _load_json_file(self.session.dir / "job-state" / "jobs" / "jobs.json"),
+        }
+        if operation in {"load", "state", "list"}:
+            return ToolResult("monitor", "OK", "Loaded runtime monitor state", data)
+        return ToolResult("monitor", "OK", f"Monitor operation {operation}", data)
+
+    def _lsp(self, parameters: dict[str, Any]) -> ToolResult:
+        raw_command = parameters.get("command")
+        if isinstance(raw_command, list):
+            command = [str(item) for item in raw_command]
+        else:
+            command = shlex.split(str(raw_command or ""))
+        result = run_lsp_command(command, project_root=self.project_root, timeout=int(parameters.get("timeout", 30)))
+        self.session.event("lsp.command", "LSP command executed", command=command, status=result.get("status"))
+        return ToolResult("lsp", str(result.get("status") or "OK"), "LSP command executed", {"command": command, "result": result})
 
     def _project_memory_read(self, parameters: dict[str, Any]) -> ToolResult:
         section = str(parameters.get("section") or "all")
@@ -850,6 +1179,29 @@ class ToolExecutor:
                 result,
             )
         return ToolResult("mcp", "OK", f"Called MCP tool {tool}", result)
+
+    def _mcp_auth(self, parameters: dict[str, Any]) -> ToolResult:
+        server = str(parameters.get("server") or parameters.get("server_name") or parameters.get("name") or "")
+        raw_tool = str(parameters.get("tool") or "")
+        if not server and raw_tool.startswith("mcp__"):
+            server = raw_tool.removeprefix("mcp__").split("__", 1)[0]
+        if not server:
+            raise ToolExecutionError("mcp_auth requires `server` or `tool`")
+        try:
+            result = authenticate_mcp_server(
+                project_root=self.project_root,
+                server_name=server,
+                callback_url=str(parameters.get("callback_url") or "") or None,
+                code=str(parameters.get("code") or "") or None,
+                extra_servers=self.agent_mcp_servers,
+                additional_dirs=self.additional_dirs,
+            )
+        except Exception as exc:
+            return ToolResult("mcp_auth", "BLOCKED", str(exc), {"server": server})
+        status = str(result.get("status") or result.get("result", {}).get("status") or "")
+        tool_status = "OK" if status in {"authenticated", "auth_url"} else "BLOCKED"
+        message = str(result.get("message") or result.get("result", {}).get("message") or f"MCP auth {status or 'completed'} for {server}")
+        return ToolResult("mcp_auth", tool_status, message, result)
 
     def _list_mcp_resources(self, parameters: dict[str, Any]) -> ToolResult:
         server = str(parameters.get("server") or parameters.get("server_name") or "")
@@ -1196,6 +1548,8 @@ _TOOL_ALIASES = {
     "TerminalCapture": "terminal_capture",
     "repl": "repl",
     "REPL": "repl",
+    "sleep": "sleep",
+    "Sleep": "sleep",
     "task": "task",
     "Task": "task",
     "agent": "agent",
@@ -1223,6 +1577,9 @@ _TOOL_ALIASES = {
     "TodoWrite": "todo_write",
     "skill": "skill",
     "Skill": "skill",
+    "discoverskills": "discover_skills",
+    "discover_skills": "discover_skills",
+    "DiscoverSkills": "discover_skills",
     "toolsearch": "tool_search",
     "tool_search": "tool_search",
     "ToolSearch": "tool_search",
@@ -1235,9 +1592,12 @@ _TOOL_ALIASES = {
     "verifyplanexecution": "plan_mode",
     "verify_plan_execution": "plan_mode",
     "VerifyPlanExecution": "plan_mode",
+    "verifyplanexecutiontool": "plan_mode",
     "planmode": "plan_mode",
     "plan_mode": "plan_mode",
     "PlanMode": "plan_mode",
+    "config": "config",
+    "Config": "config",
     "project_memory_read": "project_memory_read",
     "ProjectMemoryRead": "project_memory_read",
     "project_memory_write": "project_memory_write",
@@ -1247,6 +1607,54 @@ _TOOL_ALIASES = {
     "capability_list": "capability_list",
     "CapabilityList": "capability_list",
     "capabilities": "capability_list",
+    "notebookedit": "notebook_edit",
+    "notebook_edit": "notebook_edit",
+    "NotebookEdit": "notebook_edit",
+    "snip": "snip",
+    "Snip": "snip",
+    "senduserfile": "send_user_file",
+    "send_user_file": "send_user_file",
+    "SendUserFile": "send_user_file",
+    "reviewartifact": "review_artifact",
+    "review_artifact": "review_artifact",
+    "ReviewArtifact": "review_artifact",
+    "brief": "brief",
+    "Brief": "brief",
+    "sendusermessage": "brief",
+    "SendUserMessage": "brief",
+    "remote_trigger": "remote_trigger",
+    "remotetrigger": "remote_trigger",
+    "RemoteTrigger": "remote_trigger",
+    "structured_output": "structured_output",
+    "structuredoutput": "structured_output",
+    "StructuredOutput": "structured_output",
+    "workflow": "workflow",
+    "Workflow": "workflow",
+    "teamcreate": "team_create",
+    "team_create": "team_create",
+    "TeamCreate": "team_create",
+    "teamdelete": "team_delete",
+    "team_delete": "team_delete",
+    "TeamDelete": "team_delete",
+    "enterworktree": "enter_worktree",
+    "enter_worktree": "enter_worktree",
+    "EnterWorktree": "enter_worktree",
+    "exitworktree": "exit_worktree",
+    "exit_worktree": "exit_worktree",
+    "ExitWorktree": "exit_worktree",
+    "croncreate": "cron_create",
+    "cron_create": "cron_create",
+    "CronCreate": "cron_create",
+    "cronlist": "cron_list",
+    "cron_list": "cron_list",
+    "CronList": "cron_list",
+    "crondelete": "cron_delete",
+    "cron_delete": "cron_delete",
+    "CronDelete": "cron_delete",
+    "monitor": "monitor",
+    "Monitor": "monitor",
+    "lsp": "lsp",
+    "LSP": "lsp",
     "webfetch": "web_fetch",
     "web_fetch": "web_fetch",
     "WebFetch": "web_fetch",
@@ -1258,6 +1666,12 @@ _TOOL_ALIASES = {
     "WebBrowser": "web_browser",
     "mcp": "mcp",
     "MCP": "mcp",
+    "mcpauth": "mcp_auth",
+    "mcp_auth": "mcp_auth",
+    "mcpauthenticate": "mcp_auth",
+    "mcp_authenticate": "mcp_auth",
+    "McpAuth": "mcp_auth",
+    "McpAuthTool": "mcp_auth",
     "listmcpresources": "list_mcp_resources",
     "list_mcp_resources": "list_mcp_resources",
     "ListMcpResources": "list_mcp_resources",
@@ -1298,6 +1712,7 @@ _CLAUDE_TOOL_NAMES = {
     "powershell": "PowerShell",
     "terminal_capture": "TerminalCapture",
     "repl": "REPL",
+    "sleep": "Sleep",
     "task": "Task",
     "agent": "Agent",
     "task_create": "TaskCreate",
@@ -1308,16 +1723,36 @@ _CLAUDE_TOOL_NAMES = {
     "ask_user_question": "AskUserQuestion",
     "todo_write": "TodoWrite",
     "skill": "Skill",
+    "discover_skills": "DiscoverSkills",
     "tool_search": "ToolSearch",
     "plan_mode": "PlanMode",
+    "config": "Config",
     "project_memory_read": "Read",
     "project_memory_write": "Write",
     "asset_register": "Write",
     "capability_list": "Read",
+    "notebook_edit": "NotebookEdit",
+    "snip": "Snip",
+    "send_user_file": "SendUserFile",
+    "review_artifact": "ReviewArtifact",
+    "brief": "Brief",
+    "remote_trigger": "RemoteTrigger",
+    "structured_output": "StructuredOutput",
+    "workflow": "Workflow",
+    "team_create": "TeamCreate",
+    "team_delete": "TeamDelete",
+    "enter_worktree": "EnterWorktree",
+    "exit_worktree": "ExitWorktree",
+    "cron_create": "CronCreate",
+    "cron_list": "CronList",
+    "cron_delete": "CronDelete",
+    "monitor": "Monitor",
+    "lsp": "LSP",
     "web_fetch": "WebFetch",
     "web_search": "WebSearch",
     "web_browser": "WebBrowser",
     "mcp": "mcp",
+    "mcp_auth": "McpAuth",
     "list_mcp_resources": "ListMcpResources",
     "read_mcp_resource": "ReadMcpResource",
     "mcp_elicitation": "McpElicitation",
@@ -1366,11 +1801,21 @@ def _allowed_by_frontmatter(tool: str, parameters: dict[str, Any], allowed: set[
     }
     if tool.startswith("task_"):
         candidates.update({"Task", "task"})
-    if tool in {"list_mcp_resources", "read_mcp_resource", "mcp_elicitation"}:
+    if tool in {"mcp_auth", "list_mcp_resources", "read_mcp_resource", "mcp_elicitation"}:
         candidates.update({"mcp", "MCP"})
+    if tool in {"snip", "send_user_file", "discover_skills", "monitor", "config", "cron_list"}:
+        candidates.update({"Read", "read"})
+    if tool in {"notebook_edit", "review_artifact", "brief", "remote_trigger", "structured_output", "workflow", "team_create", "team_delete", "cron_create", "cron_delete"}:
+        candidates.update({"Write", "write", "Edit", "edit"})
+    if tool in {"enter_worktree", "exit_worktree", "sleep", "lsp"}:
+        candidates.update({"Bash", "bash"})
     mcp_tool = str(parameters.get("tool") or "")
     if tool == "mcp" and mcp_tool:
         candidates.add(mcp_tool)
+    if tool == "mcp_auth":
+        server = str(parameters.get("server") or parameters.get("server_name") or parameters.get("name") or "")
+        if server:
+            candidates.add(f"mcp__{server}__authenticate")
     command = str(parameters.get("command") or "")
     for raw in allowed:
         token = raw.strip()
@@ -1402,17 +1847,21 @@ def _claude_permission_parameters(tool: str, parameters: dict[str, Any]) -> dict
         return {"path": str(parameters.get("path", ""))}
     if tool in {"edit_file", "multi_edit"}:
         return {"path": str(parameters.get("path", ""))}
+    if tool == "notebook_edit":
+        return {"path": str(parameters.get("notebook_path") or parameters.get("path") or "")}
+    if tool in {"snip", "send_user_file"}:
+        return {"path": str(parameters.get("path") or parameters.get("file_path") or "")}
     if tool == "bash":
         return {"command": str(parameters.get("command", ""))}
-    if tool in {"powershell", "terminal_capture", "repl"}:
+    if tool in {"powershell", "terminal_capture", "repl", "lsp"}:
         return {"command": str(parameters.get("command") or parameters.get("code") or "")}
     if tool == "web_fetch":
         return {"url": str(parameters.get("url", ""))}
     if tool == "mcp":
         return {"tool": str(parameters.get("tool", ""))}
-    if tool in {"list_mcp_resources", "read_mcp_resource", "mcp_elicitation"}:
+    if tool in {"mcp_auth", "list_mcp_resources", "read_mcp_resource", "mcp_elicitation"}:
         return {"server": str(parameters.get("server") or ""), "uri": str(parameters.get("uri") or "")}
-    if tool in {"bridge", "voice", "ide", "plan_mode", "web_browser"}:
+    if tool in {"bridge", "voice", "ide", "plan_mode", "web_browser", "config", "workflow", "monitor"}:
         return {"operation": str(parameters.get("operation") or parameters.get("action") or "")}
     return parameters
 
@@ -1438,6 +1887,14 @@ def _claude_tool_input(tool: str, parameters: dict[str, Any]) -> dict[str, Any]:
         return {"command": parameters.get("command", ""), "shell": str(parameters.get("shell") or "")}
     if tool == "repl":
         return {"language": str(parameters.get("language") or "python"), "code": str(parameters.get("code") or "")}
+    if tool == "notebook_edit":
+        return {
+            "notebook_path": str(parameters.get("notebook_path") or parameters.get("path") or ""),
+            "cell_number": parameters.get("cell_number", parameters.get("index", "")),
+            "edit_mode": str(parameters.get("edit_mode") or parameters.get("mode") or "replace"),
+        }
+    if tool in {"snip", "send_user_file"}:
+        return {"path": str(parameters.get("path") or parameters.get("file_path") or "")}
     if tool == "web_fetch":
         return {"url": str(parameters.get("url", ""))}
     if tool == "web_search":
@@ -1484,6 +1941,10 @@ def _task_key(parameters: dict[str, Any]) -> str:
     return value
 
 
+def _list_task_id(parameters: dict[str, Any]) -> str:
+    return str(parameters.get("taskId") or parameters.get("task_id") or parameters.get("id") or "").strip()
+
+
 def _plan_operation_from_raw_tool(raw_tool: str) -> str:
     lowered = raw_tool.strip().lower().replace("-", "_")
     if lowered in {"enterplanmode", "enter_plan_mode"}:
@@ -1504,6 +1965,21 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
+def _bool_parameter(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _voice_session_data(session: Any) -> dict[str, Any]:
     return {
         "session_id": session.session_id,
@@ -1512,6 +1988,33 @@ def _voice_session_data(session: Any) -> dict[str, Any]:
         "started_at": session.started_at,
         "finalized_at": session.finalized_at,
     }
+
+
+def _load_json_file(path: Path) -> Any:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _load_jsonl_file(path: Path) -> list[Any]:
+    if not path.exists():
+        return []
+    rows = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
 
 
 def _normalize_action_parameters(tool: str, parameters: dict[str, Any]) -> dict[str, Any]:

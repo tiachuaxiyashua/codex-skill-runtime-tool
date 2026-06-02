@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -36,13 +37,12 @@ class WorkerRegistry:
         self._records: dict[str, WorkerRecord] = {}
         self._names: dict[str, str] = {}
         self._counter = 0
+        self._lock = threading.RLock()
         self._load()
 
     def spawn(self, *, agent: str, purpose: str, prompt: str, name: str | None = None) -> WorkerRecord:
-        self._counter += 1
-        worker_id = f"worker-{self._counter:03d}"
-        scratchpad_dir = self._scratchpad_dir(worker_id)
-        output = self.runner(agent, purpose, _with_scratchpad(prompt, scratchpad_dir), self._counter)
+        worker_id, scratchpad_dir, index = self._allocate_worker()
+        output = self.runner(agent, purpose, _with_scratchpad(prompt, scratchpad_dir), index)
         record = WorkerRecord(
             id=worker_id,
             agent=agent,
@@ -51,10 +51,56 @@ class WorkerRegistry:
             scratchpad_dir=str(scratchpad_dir) if scratchpad_dir is not None else "",
             turns=[{"prompt": prompt, "output": output}],
         )
-        self._records[worker_id] = record
-        if name:
-            self._names[name] = worker_id
-        self._save()
+        with self._lock:
+            self._records[worker_id] = record
+            if name:
+                self._names[name] = worker_id
+            self._save()
+        return record
+
+    def spawn_async(self, *, agent: str, purpose: str, prompt: str, name: str | None = None) -> WorkerRecord:
+        worker_id, scratchpad_dir, index = self._allocate_worker()
+        record = WorkerRecord(
+            id=worker_id,
+            agent=agent,
+            purpose=purpose,
+            name=name,
+            status="running",
+            scratchpad_dir=str(scratchpad_dir) if scratchpad_dir is not None else "",
+            turns=[{"prompt": prompt, "output": ""}],
+        )
+        with self._lock:
+            self._records[worker_id] = record
+            if name:
+                self._names[name] = worker_id
+            self._save()
+
+        def run() -> None:
+            try:
+                output = self.runner(agent, purpose, _with_scratchpad(prompt, scratchpad_dir), index)
+            except Exception as exc:
+                with self._lock:
+                    current = self._records.get(worker_id)
+                    if current is None:
+                        return
+                    current.turns[-1]["output"] = f"Worker failed: {type(exc).__name__}: {exc}"
+                    if current.status not in {"stopped", "cancelled"}:
+                        current.status = "failed"
+                    current.updated_at = datetime.now().isoformat(timespec="seconds")
+                    self._save()
+                return
+            with self._lock:
+                current = self._records.get(worker_id)
+                if current is None:
+                    return
+                current.turns[-1]["output"] = output
+                if current.status not in {"stopped", "cancelled"}:
+                    current.status = "completed"
+                current.updated_at = datetime.now().isoformat(timespec="seconds")
+                self._save()
+
+        thread = threading.Thread(target=run, name=f"runtime-worker-{worker_id}", daemon=True)
+        thread.start()
         return record
 
     def send(self, *, to: str, prompt: str) -> WorkerRecord:
@@ -74,18 +120,20 @@ class WorkerRegistry:
             f"New instruction:\n{prompt}"
         )
         output = self.runner(record.agent, f"Continue {record.purpose}", continuation, len(self._records) + 1)
-        record.turns.append({"prompt": prompt, "output": output})
-        record.status = "completed"
-        record.updated_at = datetime.now().isoformat(timespec="seconds")
-        self._save()
+        with self._lock:
+            record.turns.append({"prompt": prompt, "output": output})
+            record.status = "completed"
+            record.updated_at = datetime.now().isoformat(timespec="seconds")
+            self._save()
         return record
 
     def stop(self, *, to: str, reason: str = "") -> WorkerRecord:
         record = self._find(to)
-        record.status = "stopped"
-        record.turns.append({"prompt": f"TASK_STOP: {reason}", "output": "Worker marked stopped by runtime."})
-        record.updated_at = datetime.now().isoformat(timespec="seconds")
-        self._save()
+        with self._lock:
+            record.status = "stopped"
+            record.turns.append({"prompt": f"TASK_STOP: {reason}", "output": "Worker marked stopped by runtime."})
+            record.updated_at = datetime.now().isoformat(timespec="seconds")
+            self._save()
         return record
 
     def get(self, to: str) -> WorkerRecord:
@@ -122,18 +170,19 @@ class WorkerRegistry:
         if prompt:
             return self.send(to=to, prompt=prompt)
         record = self._find(to)
-        if status:
-            record.status = status
-        if purpose:
-            record.purpose = purpose
-        if name is not None:
-            if record.name:
-                self._names.pop(record.name, None)
-            record.name = name or None
-            if record.name:
-                self._names[record.name] = record.id
-        record.updated_at = datetime.now().isoformat(timespec="seconds")
-        self._save()
+        with self._lock:
+            if status:
+                record.status = status
+            if purpose:
+                record.purpose = purpose
+            if name is not None:
+                if record.name:
+                    self._names.pop(record.name, None)
+                record.name = name or None
+                if record.name:
+                    self._names[record.name] = record.id
+            record.updated_at = datetime.now().isoformat(timespec="seconds")
+            self._save()
         return record
 
     def describe(self) -> list[dict[str, str]]:
@@ -158,6 +207,14 @@ class WorkerRegistry:
         if worker_id not in self._records:
             raise KeyError(f"worker not found: {key}")
         return self._records[worker_id]
+
+    def _allocate_worker(self) -> tuple[str, Path | None, int]:
+        with self._lock:
+            self._counter += 1
+            index = self._counter
+            worker_id = f"worker-{index:03d}"
+            scratchpad_dir = self._scratchpad_dir(worker_id)
+            return worker_id, scratchpad_dir, index
 
     def _save(self) -> None:
         if self.session_dir is None:
@@ -211,6 +268,10 @@ class WorkerRegistry:
                 updated_at=str(item.get("updated_at") or datetime.now().isoformat(timespec="seconds")),
                 scratchpad_dir=str(item.get("scratchpad_dir") or ""),
             )
+            if record.status == "running":
+                record.status = "interrupted"
+                if record.turns and not record.turns[-1].get("output"):
+                    record.turns[-1]["output"] = "Worker was running when the registry was reloaded; continue it with SendMessage if more work is needed."
             self._records[record.id] = record
             try:
                 suffix = int(record.id.rsplit("-", 1)[-1])

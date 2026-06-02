@@ -22,6 +22,7 @@ from .hooks import HookDispatcher, hook_block_reason, hook_updated_input
 from .ide import IDESelection, ide_context, write_ide_diagnostics, write_ide_selection
 from .large_results import write_replacement_manifest
 from .loaders import SkillRepositoryLoader
+from .memdir import consolidate_memories, extract_session_memories, relevant_memory_context, scan_memory_files
 from .memory import project_memory_context, record_session_summary, runtime_memory_context
 from .mcp import discover_mcp_servers, mcp_instructions_context
 from .mcp_oauth import complete_oauth_authorization, start_oauth_authorization, stored_oauth_headers, token_record_from_auth_output
@@ -33,9 +34,11 @@ from .questions import answer_pending_question, load_pending_question, pending_q
 from .runtime import CodexSkillRuntime
 from .secure_store import SecureTokenStore
 from .session import RuntimeSession
+from .session_memory import session_memory_context, update_session_memory
 from .state_paths import runtime_state_path
 from .system_prompt import SystemPromptOptions, build_compat_system_prompt, clear_system_prompt_section_cache
 from .tasks import parse_task_requests
+from .token_budget import ContextSection, apply_context_budget
 from .tool_executor import ToolExecutor
 from .transcript import replay_context
 from .voice import VoiceRuntime, session_text, voice_context
@@ -100,6 +103,9 @@ class SelfTester:
             self._codex_api_proxy_config_contract,
             self._isolated_runtime_env_contract,
             self._memory_compaction_contract,
+            self._session_memory_contract,
+            self._memdir_recall_contract,
+            self._token_budget_contract,
             self._microcompact_contract,
             self._system_prompt_contract,
             self._transcript_resume_contract,
@@ -1042,6 +1048,79 @@ class SelfTester:
         self._assert("selftest-memory" in context and "Memory summary probe" in context, "runtime memory context did not include summary")
         return f"session={session.id}"
 
+    def _session_memory_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-session-memory")
+        session.event("session.start", "session memory contract start", arguments="alpha beta")
+        session.write_json(
+            "tools/001-read_file.json",
+            {
+                "tool": "read_file",
+                "status": "OK",
+                "summary": "Read contract file",
+                "data": {"path": "README.md", "content": "SESSION_MEMORY_MARKER"},
+            },
+        )
+        session.update_read_state(self.project_root / "README.md", "SESSION_MEMORY_READ_STATE")
+        path = update_session_memory(
+            session,
+            command="selftest-session-memory",
+            arguments="alpha beta",
+            note="SESSION_MEMORY_NOTE_MARKER",
+            status="PASS",
+        )
+        self._assert(path.exists(), "session memory summary was not written")
+        context = session_memory_context(session)
+        self._assert("Runtime Session Memory" in context, "session memory context header missing")
+        self._assert("SESSION_MEMORY_NOTE_MARKER" in context, "session memory note missing")
+        self._assert("Recent Tool Results" in context, "session memory tool section missing")
+        state = json.loads((session.dir / "session-memory" / "state.json").read_text(encoding="utf-8"))
+        self._assert(state.get("tool_count") == 1, "session memory state did not count tools")
+        return f"session={session.id}"
+
+    def _memdir_recall_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-memdir")
+        session.event("session.start", "memdir contract start")
+        record_session_summary(
+            session,
+            command="selftest-memdir",
+            arguments="durable alpha",
+            status="PASS",
+            notes="DURABLE_MEMORY_MARKER",
+            gates=[],
+        )
+        paths = extract_session_memories(
+            self.project_root,
+            session,
+            command="selftest-memdir",
+            arguments="durable alpha",
+            status="PASS",
+            notes="DURABLE_MEMORY_MARKER",
+            gates=[],
+        )
+        self._assert(paths and paths[0].exists(), "durable memory topic was not written")
+        headers = scan_memory_files(self.project_root)
+        self._assert(any(header.filename.endswith("selftest-memdir.md") for header in headers), "memdir scan did not find topic")
+        context = relevant_memory_context(self.project_root, query="durable alpha selftest-memdir")
+        self._assert("Runtime Durable Memory Directory" in context, "durable memory context header missing")
+        self._assert("DURABLE_MEMORY_MARKER" in context, "relevant durable memory did not include extracted note")
+        overview = consolidate_memories(self.project_root, force=True)
+        self._assert(overview is not None and overview.exists(), "memory consolidation overview was not written")
+        self._assert("Runtime Durable Memory" in overview.read_text(encoding="utf-8"), "memory overview content missing")
+        return f"session={session.id}"
+
+    def _token_budget_contract(self) -> str:
+        sections = [
+            ContextSection("required", "REQUIRED_CONTEXT_MARKER", required=True, priority=1),
+            ContextSection("large-optional", "OPTIONAL_CONTEXT_MARKER " + ("x" * 60000), priority=50),
+        ]
+        result = apply_context_budget(sections, context_window=6000, reserve_tokens=1000, min_preserved_tokens=1000)
+        text = "\n".join(section.text for section in result.sections)
+        self._assert("REQUIRED_CONTEXT_MARKER" in text, "required context was dropped")
+        self._assert(result.estimated_tokens_after < result.estimated_tokens_before, "budget did not reduce context")
+        self._assert("Runtime Context Budget" in result.report, "budget report header missing")
+        self._assert(result.target_tokens == 5000, "budget target mismatch")
+        return f"before={result.estimated_tokens_before} after={result.estimated_tokens_after}"
+
     def _microcompact_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-microcompact")
         observations = [
@@ -1166,6 +1245,28 @@ class SelfTester:
                 "notes": "TRANSCRIPT_SUMMARY_MARKER",
             },
         )
+        update_session_memory(
+            session,
+            command="selftest-transcript",
+            arguments="resume",
+            note="TRANSCRIPT_SESSION_MEMORY_MARKER",
+            status="PASS",
+        )
+
+        def runner(agent: str, purpose: str, prompt: str, index: int) -> str:
+            return f"TRANSCRIPT_WORKER_OUTPUT:{agent}:{index}"
+
+        registry = WorkerRegistry(runner, session_dir=session.dir)
+        registry.spawn(agent="resume-worker", purpose="resume worker probe", prompt="worker prompt", name="resume-probe")
+        extract_session_memories(
+            self.project_root,
+            session,
+            command="selftest-transcript",
+            arguments="resume",
+            status="PASS",
+            notes="DURABLE_REPLAY_MARKER",
+            gates=[],
+        )
         full_path = session.path("large-tool-results", "001-data.txt")
         full_path.write_text("FULL_REPLACEMENT_MARKER", encoding="utf-8")
         write_replacement_manifest(
@@ -1183,6 +1284,9 @@ class SelfTester:
         context = replay_context(self.project_root, session.id)
         self._assert("Runtime Transcript Replay" in context, "replay header missing")
         self._assert("TRANSCRIPT_SUMMARY_MARKER" in context, "summary note missing from replay")
+        self._assert("TRANSCRIPT_SESSION_MEMORY_MARKER" in context, "session memory missing from replay")
+        self._assert("resume-worker" in context and "worker-001" in context, "worker records missing from replay")
+        self._assert("DURABLE_REPLAY_MARKER" in context, "durable memory missing from replay")
         self._assert("tool.finish" in context, "tool timeline missing from replay")
         self._assert("Content Replacements" in context and "data.content" in context, "replacement manifest missing from replay")
         runtime = CodexSkillRuntime(
@@ -1196,6 +1300,7 @@ class SelfTester:
         self._assert(resumed.exit_code == 0 and resumed.primary is not None, "dry-run resume failed")
         prompt_text = resumed.primary.prompt_path.read_text(encoding="utf-8", errors="replace")
         self._assert("Runtime Transcript Replay" in prompt_text, "resume prompt did not include replay context")
+        self._assert("Runtime Context Budget" in prompt_text, "resume prompt did not include runtime context budget")
         return f"session={session.id} resume_session={resumed.session.id}"
 
     def _mcp_oauth_store_contract(self) -> str:
@@ -1410,7 +1515,7 @@ class SelfTester:
             calls.append((agent, purpose, prompt, index))
             return f"OUTPUT:{agent}:{index}:{prompt[-20:]}"
 
-        registry = WorkerRegistry(runner)
+        registry = WorkerRegistry(runner, session_dir=session.dir)
         executor = ToolExecutor(
             project_root=self.project_root,
             hooks=HookDispatcher([], self.project_root),
@@ -1424,6 +1529,13 @@ class SelfTester:
         self._assert(continued.status == "OK" and len(calls) == 2, "SendMessage did not continue named worker")
         stopped = executor.execute({"tool": "TaskStop", "parameters": {"task_id": "worker-001", "reason": "done"}})
         self._assert(stopped.status == "OK" and stopped.data.get("status") == "stopped", "TaskStop did not stop worker")
+        workers_path = session.dir / "workers.json"
+        self._assert(workers_path.exists(), "worker registry was not persisted")
+        persisted = json.loads(workers_path.read_text(encoding="utf-8", errors="replace"))
+        self._assert(persisted.get("workers") and persisted["workers"][0].get("id") == "worker-001", "persisted worker id missing")
+        reloaded = WorkerRegistry(runner, session_dir=session.dir)
+        described = reloaded.describe()
+        self._assert(described and described[0].get("status") == "stopped", "persisted worker status was not restored")
         return f"session={session.id}"
 
     def _large_tool_result_contract(self) -> str:

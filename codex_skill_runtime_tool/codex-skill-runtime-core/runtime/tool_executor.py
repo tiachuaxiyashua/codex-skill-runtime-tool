@@ -25,6 +25,7 @@ from .memory import agent_memory_context, read_project_memory, record_asset, wri
 from .prompts import render_markdown_body
 from .questions import record_pending_question
 from .session import RuntimeSession
+from .session_memory import maybe_update_session_memory
 from .voice import VoiceRuntime, session_text, voice_context
 from .workers import WorkerRegistry
 
@@ -184,6 +185,10 @@ class ToolExecutor:
             evidence={"tool_result": str(result_path), "summary": result.summary},
             metadata={"tool_id": tool_id},
         )
+        try:
+            maybe_update_session_memory(self.session, note=f"{tool} {result.status}: {result.summary}")
+        except Exception as exc:
+            self.session.event("memory.error", "Failed to update session memory after tool execution", error=str(exc))
         return result
 
     def _read_file(self, parameters: dict[str, Any]) -> ToolResult:

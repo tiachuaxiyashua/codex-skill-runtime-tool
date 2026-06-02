@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .state_paths import runtime_state_path
+from .memdir import relevant_memory_context
+from .session_memory import session_memory_context
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,7 @@ def replay_context(
     events = load_transcript(transcript_path_for_session(session_dir))
     read_state = _load_json(session_dir / "read-state.json")
     summary = _load_json(session_dir / "summary.json")
+    workers = _load_json(session_dir / "workers.json")
     replacements = load_replacement_manifest(session_dir)
 
     lines = [
@@ -115,6 +118,22 @@ def replay_context(
         if notes:
             lines.extend(["```text", notes[:8000], "```", ""])
 
+    session_memory = session_memory_context(session_dir)
+    if session_memory:
+        lines.extend(["### Rolling Session Memory", "", session_memory, ""])
+
+    worker_rows = workers.get("workers") if isinstance(workers, dict) else []
+    if isinstance(worker_rows, list) and worker_rows:
+        lines.extend(["### Worker Records", ""])
+        for worker in worker_rows:
+            if not isinstance(worker, dict):
+                continue
+            lines.append(
+                f"- `{worker.get('id', '')}` name={worker.get('name', '')} agent={worker.get('agent', '')} "
+                f"status={worker.get('status', '')} updated={worker.get('updated_at', '')}"
+            )
+        lines.append("")
+
     lines.append("### Event Timeline")
     for event in _important_events(events)[-120:]:
         lines.append(_event_line(event))
@@ -136,6 +155,10 @@ def replay_context(
                 f"bytes={item.get('bytes', '')} full={item.get('path', '')}"
             )
         lines.append("")
+
+    durable = relevant_memory_context(project_root, query=_replay_query(summary, events))
+    if durable:
+        lines.extend(["### Relevant Durable Memory", "", durable, ""])
 
     text = "\n".join(lines).strip()
     if len(text) > max_chars:
@@ -175,7 +198,7 @@ def _important_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     keep = []
     for event in events:
         type_ = str(event.get("type") or "")
-        if type_.startswith(("codex.", "tool.", "session.", "hook.", "transcript.", "bridge.", "voice.", "ide.", "microcompact.")):
+        if type_.startswith(("codex.", "tool.", "session.", "hook.", "transcript.", "bridge.", "voice.", "ide.", "microcompact.", "memory.")):
             keep.append(event)
     return keep
 
@@ -202,3 +225,17 @@ def _load_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, ValueError):
         return None
+
+
+def _replay_query(summary: Any, events: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    if isinstance(summary, dict):
+        for key in ("command", "arguments", "notes", "status"):
+            if summary.get(key):
+                parts.append(str(summary.get(key)))
+    for event in events[-30:]:
+        parts.append(str(event.get("message") or ""))
+        data = event.get("data")
+        if isinstance(data, dict):
+            parts.append(json.dumps(data, ensure_ascii=False)[:1000])
+    return "\n".join(part for part in parts if part)

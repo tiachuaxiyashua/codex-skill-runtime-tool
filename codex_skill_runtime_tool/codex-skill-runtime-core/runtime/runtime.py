@@ -18,11 +18,13 @@ from .gates import GateResult, evaluate_qa_report
 from .hooks import HookDispatcher, hook_block_reason
 from .ide import ide_context
 from .loaders import SkillRepositoryLoader
+from .memdir import consolidate_memories, extract_session_memories, relevant_memory_context
 from .mcp import mcp_instructions_context, servers_from_agent_mcp_specs
 from .memory import agent_memory_context, project_memory_context, record_session_summary, runtime_memory_context
 from .prompts import agent_task_prompt, qa_prompt, skill_prompt
 from .questions import answer_pending_question, pending_question_context
 from .session import RuntimeSession
+from .session_memory import maybe_update_session_memory, session_memory_context
 from .state_machines import build_workflow_plan
 from .system_prompt import (
     SystemPromptOptions,
@@ -31,6 +33,7 @@ from .system_prompt import (
     resolve_system_prompt_value,
 )
 from .tasks import parse_task_requests
+from .token_budget import ContextSection, apply_context_budget, budget_context_for_prompt, context_window_tokens
 from .tool_executor import ToolExecutor
 from .transcript import replay_context
 from .voice import voice_context
@@ -332,7 +335,7 @@ class CodexSkillRuntime:
                 tasks.append(result)
             return result.last_message
 
-        worker_registry = WorkerRegistry(task_runner)
+        worker_registry = WorkerRegistry(task_runner, session_dir=session.dir)
 
         executor = ToolExecutor(
             project_root=self.project_root,
@@ -553,6 +556,7 @@ class CodexSkillRuntime:
         session = self._new_session("resume")
         context = replay_context(self.project_root, session_or_path)
         question_context = pending_question_context(self.project_root, session_or_path)
+        runtime_context = self._context_bundle(session=session)
         session.event("session.start", "Starting transcript resume", source=session_or_path)
         session.set_status("running")
         resume_node = session.start_node("skill", "resume", metadata={"source": session_or_path, "prompt": prompt_text[:1000]})
@@ -561,6 +565,8 @@ class CodexSkillRuntime:
             "Continue from the reconstructed prior runtime transcript. Do not assume files are unchanged; verify live files before editing.\n\n"
             f"{context}\n\n"
             f"{question_context}\n\n"
+            "## Current Runtime Context\n\n"
+            f"{runtime_context}\n\n"
             "## New User Instruction\n\n"
             f"{prompt_text or 'Continue the previous workflow and report the next useful action.'}\n"
         )
@@ -1103,32 +1109,40 @@ class CodexSkillRuntime:
         )
 
     def _context_bundle(self, *, session: RuntimeSession, hook_results: list[object] | None = None) -> str:
-        sections = []
+        sections: list[ContextSection] = []
+
+        def add_section(name: str, text: str, *, priority: int = 100, required: bool = False) -> None:
+            if text:
+                sections.append(ContextSection(name=name, text=text, priority=priority, required=required))
+
         context = self.loader.read_context_bundle()
-        if context:
-            sections.append(context)
+        add_section("context-files", context, priority=10, required=True)
         touched_paths = session.touched_paths()
-        for runtime_context in [
-            bridge_context(self.project_root),
-            voice_context(self.project_root),
-            ide_context(self.project_root),
-            mcp_instructions_context(self.project_root, additional_dirs=self.additional_dirs),
-            capability_context(self.project_root, additional_dirs=self.additional_dirs),
-            project_memory_context(self.project_root),
-            session.invoked_skills_context(max_chars=20000),
-        ]:
-            if runtime_context:
-                sections.append(runtime_context)
+        add_section("bridge-context", bridge_context(self.project_root), priority=30)
+        add_section("voice-context", voice_context(self.project_root), priority=35)
+        add_section("ide-context", ide_context(self.project_root), priority=35)
+        add_section("mcp-context", mcp_instructions_context(self.project_root, additional_dirs=self.additional_dirs), priority=20)
+        add_section("capability-context", capability_context(self.project_root, additional_dirs=self.additional_dirs), priority=20)
+        add_section("project-memory", project_memory_context(self.project_root), priority=25)
+        add_section("session-memory", session_memory_context(session), priority=15, required=True)
+        add_section("invoked-skills", session.invoked_skills_context(max_chars=20000), priority=15, required=True)
         skill_registry = self.loader.skill_registry_context(
             touched_paths=touched_paths,
             context_window_tokens=_context_window_tokens(),
         )
-        if skill_registry:
-            sections.append(skill_registry)
+        add_section("skill-registry", skill_registry, priority=40)
+        durable_memory = relevant_memory_context(
+            self.project_root,
+            query=_context_query(session),
+            recent_tools=_recent_tool_names(session),
+        )
+        add_section("durable-memory", durable_memory, priority=45)
         memory = runtime_memory_context(self.project_root, exclude_session=session.id)
-        if memory:
-            sections.append(memory)
-        bundle = "\n\n---\n\n".join(sections)
+        add_section("runtime-memory", memory, priority=60)
+        budgeted = apply_context_budget(sections, context_window=context_window_tokens())
+        bundle_sections = [section.text for section in budgeted.sections]
+        bundle_sections.append(budget_context_for_prompt(budgeted))
+        bundle = "\n\n---\n\n".join(bundle_sections)
         if hook_results:
             return self._with_hook_skill_context(bundle, hook_results)
         return bundle
@@ -1166,6 +1180,14 @@ class CodexSkillRuntime:
         gates: list[GateResult],
     ) -> None:
         try:
+            maybe_update_session_memory(
+                session,
+                command=command,
+                arguments=arguments,
+                note=notes,
+                status=status,
+                force=True,
+            )
             record_session_summary(
                 session,
                 command=command,
@@ -1174,6 +1196,16 @@ class CodexSkillRuntime:
                 notes=notes,
                 gates=gates,
             )
+            extract_session_memories(
+                self.project_root,
+                session,
+                command=command,
+                arguments=arguments,
+                status=status,
+                notes=notes,
+                gates=gates,
+            )
+            consolidate_memories(self.project_root)
         except Exception as exc:
             session.event("memory.error", "Failed to record runtime memory", error=str(exc))
 
@@ -1183,15 +1215,42 @@ def _runtime_schema_path() -> Path:
 
 
 def _context_window_tokens() -> int | None:
-    for key in ("SKILL_RUNTIME_MODEL_CONTEXT_WINDOW", "CODEX_MODEL_CONTEXT_WINDOW", "MODEL_CONTEXT_WINDOW"):
-        value = os.environ.get(key)
-        if not value:
-            continue
+    return context_window_tokens()
+
+
+def _context_query(session: RuntimeSession) -> str:
+    parts = [session.label, json.dumps(session.metadata, ensure_ascii=False)]
+    if session.events_path.exists():
         try:
-            return int(value)
-        except ValueError:
+            events = [
+                json.loads(line)
+                for line in session.events_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.strip()
+            ]
+        except (OSError, ValueError):
+            events = []
+        for event in events[-20:]:
+            if isinstance(event, dict):
+                parts.append(str(event.get("message") or ""))
+                data = event.get("data")
+                if isinstance(data, dict):
+                    parts.append(json.dumps(data, ensure_ascii=False)[:1000])
+    return "\n".join(part for part in parts if part)
+
+
+def _recent_tool_names(session: RuntimeSession) -> list[str]:
+    tools_dir = session.dir / "tools"
+    if not tools_dir.exists():
+        return []
+    names: list[str] = []
+    for path in sorted(tools_dir.glob("*.json"))[-20:]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
             continue
-    return None
+        if isinstance(data, dict) and data.get("tool"):
+            names.append(str(data.get("tool")))
+    return names
 
 
 def _qa_auto_patterns() -> list[str]:

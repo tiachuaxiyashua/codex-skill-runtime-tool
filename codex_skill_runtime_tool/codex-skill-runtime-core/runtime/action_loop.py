@@ -12,6 +12,7 @@ from .jsonutil import parse_json_response
 from .microcompact import compact_observations
 from .prompts import skill_prompt
 from .session import RuntimeSession
+from .session_memory import maybe_update_session_memory, session_memory_context
 from .tool_executor import ToolExecutor, ToolResult
 
 
@@ -210,6 +211,16 @@ class StrictActionLoop:
         step: int,
         runtime_profile: str = "",
     ) -> str:
+        try:
+            maybe_update_session_memory(
+                self.session,
+                command=command,
+                arguments=arguments,
+                note=f"strict action loop step {step}",
+                force=step == 1,
+            )
+        except Exception as exc:
+            self.session.event("memory.error", "Failed to update session memory before strict step", error=str(exc))
         base = skill_prompt(
             command=command,
             arguments=arguments,
@@ -235,8 +246,10 @@ class StrictActionLoop:
             )
 
         invoked_section = f"\n\n---\n\n{invoked_skills}" if invoked_skills else ""
+        live_session_memory = session_memory_context(self.session)
+        session_memory_section = f"\n\n---\n\n{live_session_memory}" if live_session_memory else ""
 
-        return f"""{base}{invoked_section}
+        return f"""{base}{invoked_section}{session_memory_section}
 
 ## Strict Runtime Action Mode
 

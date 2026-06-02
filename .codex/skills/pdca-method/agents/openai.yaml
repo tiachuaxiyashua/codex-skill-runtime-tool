@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDCA方法"
+  short_description: "Use PDCA loops to analyze root causes and avoid hardcoded runtime patches"
+  default_prompt: "使用PDCA方法分析根因、设计通用机制、排除硬编码、验证证据并闭环决策"

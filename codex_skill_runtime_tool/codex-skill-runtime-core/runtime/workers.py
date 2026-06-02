@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
 
@@ -15,6 +18,7 @@ class WorkerRecord:
     name: str | None = None
     status: str = "completed"
     turns: list[dict[str, str]] = field(default_factory=list)
+    updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     @property
     def latest_output(self) -> str:
@@ -25,11 +29,13 @@ class WorkerRecord:
 
 
 class WorkerRegistry:
-    def __init__(self, runner: WorkerRunner) -> None:
+    def __init__(self, runner: WorkerRunner, *, session_dir: Path | None = None) -> None:
         self.runner = runner
+        self.session_dir = session_dir
         self._records: dict[str, WorkerRecord] = {}
         self._names: dict[str, str] = {}
         self._counter = 0
+        self._load()
 
     def spawn(self, *, agent: str, purpose: str, prompt: str, name: str | None = None) -> WorkerRecord:
         self._counter += 1
@@ -45,6 +51,7 @@ class WorkerRegistry:
         self._records[worker_id] = record
         if name:
             self._names[name] = worker_id
+        self._save()
         return record
 
     def send(self, *, to: str, prompt: str) -> WorkerRecord:
@@ -65,12 +72,16 @@ class WorkerRegistry:
         output = self.runner(record.agent, f"Continue {record.purpose}", continuation, len(self._records) + 1)
         record.turns.append({"prompt": prompt, "output": output})
         record.status = "completed"
+        record.updated_at = datetime.now().isoformat(timespec="seconds")
+        self._save()
         return record
 
     def stop(self, *, to: str, reason: str = "") -> WorkerRecord:
         record = self._find(to)
         record.status = "stopped"
         record.turns.append({"prompt": f"TASK_STOP: {reason}", "output": "Worker marked stopped by runtime."})
+        record.updated_at = datetime.now().isoformat(timespec="seconds")
+        self._save()
         return record
 
     def describe(self) -> list[dict[str, str]]:
@@ -84,6 +95,7 @@ class WorkerRegistry:
                     "purpose": record.purpose,
                     "status": record.status,
                     "latest_output": record.latest_output[:1000],
+                    "updated_at": record.updated_at,
                 }
             )
         return rows
@@ -93,3 +105,61 @@ class WorkerRegistry:
         if worker_id not in self._records:
             raise KeyError(f"worker not found: {key}")
         return self._records[worker_id]
+
+    def _save(self) -> None:
+        if self.session_dir is None:
+            return
+        path = self.session_dir / "workers.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    "counter": self._counter,
+                    "workers": [asdict(record) for record in self._records.values()],
+                    "names": self._names,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    def _load(self) -> None:
+        if self.session_dir is None:
+            return
+        path = self.session_dir / "workers.json"
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        self._counter = int(data.get("counter") or 0)
+        names = data.get("names")
+        if isinstance(names, dict):
+            self._names = {str(key): str(value) for key, value in names.items()}
+        workers = data.get("workers")
+        if not isinstance(workers, list):
+            return
+        for item in workers:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            turns = item.get("turns")
+            record = WorkerRecord(
+                id=str(item.get("id")),
+                agent=str(item.get("agent") or ""),
+                purpose=str(item.get("purpose") or ""),
+                name=str(item.get("name")) if item.get("name") else None,
+                status=str(item.get("status") or "completed"),
+                turns=[turn for turn in turns if isinstance(turn, dict)] if isinstance(turns, list) else [],
+                updated_at=str(item.get("updated_at") or datetime.now().isoformat(timespec="seconds")),
+            )
+            self._records[record.id] = record
+            try:
+                suffix = int(record.id.rsplit("-", 1)[-1])
+            except ValueError:
+                suffix = 0
+            self._counter = max(self._counter, suffix)

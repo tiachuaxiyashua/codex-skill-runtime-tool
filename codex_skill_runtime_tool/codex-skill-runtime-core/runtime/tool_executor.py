@@ -20,13 +20,18 @@ from .hooks import HookDispatcher, PermissionDecision, hook_block_reason, hook_u
 from .ide import IDESelection, ide_context, run_lsp_command, write_ide_diagnostics, write_ide_selection
 from .large_results import compact_tool_result
 from .loaders import SkillRepositoryLoader
-from .mcp import MCPBridgeError, MCPServerConfig, call_mcp_tool
+from .mcp import MCPBridgeError, MCPServerConfig, call_mcp_tool, list_mcp_resources, read_mcp_resource
 from .memory import agent_memory_context, read_project_memory, record_asset, write_agent_memory, write_project_memory
+from .plan_state import enter_plan_mode, exit_plan_mode, verify_plan_execution
 from .prompts import render_markdown_body
 from .questions import record_pending_question
 from .session import RuntimeSession
 from .session_memory import maybe_update_session_memory
+from .terminal import persist_terminal_capture, run_powershell, run_python_repl, run_terminal_capture
+from .tool_search import search_runtime_tools
+from .tool_transcript import append_tool_transcript
 from .voice import VoiceRuntime, session_text, voice_context
+from .web_browser import LightweightBrowser
 from .workers import WorkerRegistry
 
 
@@ -93,6 +98,10 @@ class ToolExecutor:
             raise ToolExecutionError("action parameters must be an object")
         if raw_tool.startswith("mcp__") and "tool" not in parameters:
             parameters["tool"] = raw_tool
+        if tool == "plan_mode" and "operation" not in parameters and "action" not in parameters:
+            operation = _plan_operation_from_raw_tool(raw_tool)
+            if operation:
+                parameters["operation"] = operation
         parameters = _normalize_action_parameters(tool, parameters)
 
         handlers = {
@@ -103,18 +112,32 @@ class ToolExecutor:
             "edit_file": self._edit_file,
             "multi_edit": self._multi_edit,
             "bash": self._bash,
+            "powershell": self._powershell,
+            "terminal_capture": self._terminal_capture,
+            "repl": self._repl,
             "task": self._task,
             "agent": self._task,
+            "task_create": self._task,
+            "task_get": self._task_get,
+            "task_list": self._task_list,
+            "task_output": self._task_output,
+            "task_update": self._task_update,
             "ask_user_question": self._ask_user_question,
             "todo_write": self._todo_write,
             "skill": self._skill,
+            "tool_search": self._tool_search,
+            "plan_mode": self._plan_mode,
             "project_memory_read": self._project_memory_read,
             "project_memory_write": self._project_memory_write,
             "asset_register": self._asset_register,
             "capability_list": self._capability_list,
             "web_fetch": self._web_fetch,
             "web_search": self._web_search,
+            "web_browser": self._web_browser,
             "mcp": self._mcp,
+            "list_mcp_resources": self._list_mcp_resources,
+            "read_mcp_resource": self._read_mcp_resource,
+            "mcp_elicitation": self._mcp_elicitation,
             "send_message": self._send_message,
             "task_stop": self._task_stop,
             "memory_read": self._memory_read,
@@ -176,8 +199,28 @@ class ToolExecutor:
                     else:
                         result = self._run_handler_with_post(tool, parameters, handler)
         tool_id = self._next_tool_id()
+        try:
+            append_tool_transcript(
+                self.session,
+                event="tool_use",
+                tool=tool,
+                tool_id=tool_id,
+                payload={"reason": action.get("reason", ""), "parameters": _compact_parameters(parameters)},
+            )
+        except Exception as exc:
+            self.session.event("tool_transcript.error", "Failed to append tool_use transcript", error=str(exc))
         result = compact_tool_result(result, session_dir=self.session.dir, tool_id=tool_id)
         self.session.event("tool.finish", result.summary, result=asdict(result))
+        try:
+            append_tool_transcript(
+                self.session,
+                event="tool_result",
+                tool=tool,
+                tool_id=tool_id,
+                payload=asdict(result),
+            )
+        except Exception as exc:
+            self.session.event("tool_transcript.error", "Failed to append tool_result transcript", error=str(exc))
         result_path = self.session.write_json(f"tools/{tool_id}-{tool}.json", asdict(result))
         self.session.finish_node(
             tool_node,
@@ -344,6 +387,80 @@ class ToolExecutor:
             },
         )
 
+    def _powershell(self, parameters: dict[str, Any]) -> ToolResult:
+        command = str(parameters["command"])
+        if self.hooks.is_denied_bash(command):
+            raise ToolExecutionError(f"PowerShell command denied by .claude/settings.json: {command}")
+        result = run_powershell(command, cwd=self.project_root, timeout=int(parameters.get("timeout", 120)))
+        status = "OK" if result.returncode == 0 else "ERROR"
+        capture = persist_terminal_capture(self.session.dir, name="powershell", result=result)
+        return ToolResult(
+            "powershell",
+            status,
+            f"PowerShell exited {result.returncode}",
+            {
+                "command": result.command,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-20000:],
+                "stderr": result.stderr[-20000:],
+                "capture": str(capture),
+            },
+        )
+
+    def _terminal_capture(self, parameters: dict[str, Any]) -> ToolResult:
+        raw_command = parameters.get("command")
+        command = [str(item) for item in raw_command] if isinstance(raw_command, list) else str(raw_command or "")
+        if not command:
+            raise ToolExecutionError("terminal_capture requires `command`")
+        if isinstance(command, str) and self.hooks.is_denied_bash(command):
+            raise ToolExecutionError(f"terminal command denied by .claude/settings.json: {command}")
+        result = run_terminal_capture(
+            command,
+            cwd=self.project_root,
+            shell=str(parameters.get("shell") or "auto"),
+            timeout=int(parameters.get("timeout", 120)),
+        )
+        capture = persist_terminal_capture(self.session.dir, name=str(parameters.get("name") or "terminal"), result=result)
+        status = "OK" if result.returncode == 0 else "ERROR"
+        return ToolResult(
+            "terminal_capture",
+            status,
+            f"Terminal command exited {result.returncode}",
+            {
+                "command": result.command,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-20000:],
+                "stderr": result.stderr[-20000:],
+                "capture": str(capture),
+            },
+        )
+
+    def _repl(self, parameters: dict[str, Any]) -> ToolResult:
+        language = str(parameters.get("language") or "python").strip().lower()
+        code_text = str(parameters.get("code") or parameters.get("input") or "")
+        if language not in {"python", "py"}:
+            return ToolResult(
+                "repl",
+                "BLOCKED",
+                f"REPL language `{language}` is not available in this runtime.",
+                {"language": language},
+            )
+        result = run_python_repl(code_text, cwd=self.project_root)
+        capture = persist_terminal_capture(self.session.dir, name="repl", result=result)
+        status = "OK" if result.returncode == 0 else "ERROR"
+        return ToolResult(
+            "repl",
+            status,
+            f"Python REPL exited {result.returncode}",
+            {
+                "language": "python",
+                "returncode": result.returncode,
+                "stdout": result.stdout[-20000:],
+                "stderr": result.stderr[-20000:],
+                "capture": str(capture),
+            },
+        )
+
     def _task(self, parameters: dict[str, Any]) -> ToolResult:
         if self.worker_registry is None and self.task_runner is None:
             raise ToolExecutionError("task runner is not configured")
@@ -373,6 +490,48 @@ class ToolExecutor:
             )
         output = self.task_runner(agent, purpose, prompt) if self.task_runner is not None else ""
         return ToolResult("task", "OK", f"Task {agent} completed", {"agent": agent, "output": output})
+
+    def _task_get(self, parameters: dict[str, Any]) -> ToolResult:
+        if self.worker_registry is None:
+            raise ToolExecutionError("worker registry is not configured")
+        key = _task_key(parameters)
+        record = self.worker_registry.get(key)
+        return ToolResult("task_get", "OK", f"Loaded worker {record.id}", {"worker": asdict(record)})
+
+    def _task_list(self, parameters: dict[str, Any]) -> ToolResult:
+        if self.worker_registry is None:
+            raise ToolExecutionError("worker registry is not configured")
+        rows = self.worker_registry.describe()
+        status_filter = str(parameters.get("status") or "").strip()
+        if status_filter:
+            rows = [row for row in rows if row.get("status") == status_filter]
+        return ToolResult("task_list", "OK", f"Listed {len(rows)} worker task(s)", {"workers": rows})
+
+    def _task_output(self, parameters: dict[str, Any]) -> ToolResult:
+        if self.worker_registry is None:
+            raise ToolExecutionError("worker registry is not configured")
+        key = _task_key(parameters)
+        output = self.worker_registry.output(
+            key,
+            full=bool(parameters.get("full", False)),
+            max_chars=int(parameters.get("max_chars", 20000)),
+        )
+        return ToolResult("task_output", "OK", f"Loaded output for {key}", output)
+
+    def _task_update(self, parameters: dict[str, Any]) -> ToolResult:
+        if self.worker_registry is None:
+            raise ToolExecutionError("worker registry is not configured")
+        key = _task_key(parameters)
+        prompt = str(parameters.get("message") or parameters.get("prompt") or parameters.get("content") or "")
+        name = parameters.get("name")
+        record = self.worker_registry.update(
+            to=key,
+            prompt=prompt,
+            status=str(parameters.get("status") or ""),
+            purpose=str(parameters.get("purpose") or ""),
+            name=str(name) if name is not None else None,
+        )
+        return ToolResult("task_update", "OK", f"Updated worker {record.id}", {"worker": asdict(record)})
 
     def _send_message(self, parameters: dict[str, Any]) -> ToolResult:
         if self.worker_registry is None:
@@ -531,6 +690,40 @@ class ToolExecutor:
             },
         )
 
+    def _tool_search(self, parameters: dict[str, Any]) -> ToolResult:
+        query = str(parameters.get("query") or parameters.get("q") or "")
+        limit = int(parameters.get("limit", 8))
+        results = search_runtime_tools(self.project_root, query=query, limit=limit, additional_dirs=self.additional_dirs)
+        return ToolResult("tool_search", "OK", f"Found {len(results)} tool/search result(s)", {"query": query, "results": results})
+
+    def _plan_mode(self, parameters: dict[str, Any]) -> ToolResult:
+        operation = _operation(parameters)
+        if operation in {"enter", "enter_plan_mode", "plan"}:
+            state = enter_plan_mode(
+                self.session,
+                plan=str(parameters.get("plan") or parameters.get("content") or ""),
+                reason=str(parameters.get("reason") or ""),
+            )
+            self.session.event("plan.enter", "Entered runtime plan mode", state=state)
+            return ToolResult("plan_mode", "OK", "Entered plan mode", state)
+        if operation in {"exit", "exit_plan_mode", "approve"}:
+            state = exit_plan_mode(
+                self.session,
+                approved=bool(parameters.get("approved", True)),
+                reason=str(parameters.get("reason") or ""),
+            )
+            self.session.event("plan.exit", "Exited runtime plan mode", state=state)
+            return ToolResult("plan_mode", "OK", "Exited plan mode", state)
+        if operation in {"verify", "verify_plan_execution"}:
+            evidence = parameters.get("evidence")
+            if not isinstance(evidence, dict):
+                evidence = {key: value for key, value in parameters.items() if key not in {"operation", "action"}}
+            state = verify_plan_execution(self.session, evidence=evidence)
+            status = "OK" if state.get("verified") else "BLOCKED"
+            self.session.event("plan.verify", "Verified runtime plan execution", state=state)
+            return ToolResult("plan_mode", status, "Plan verification passed" if status == "OK" else "Plan verification incomplete", state)
+        raise ToolExecutionError(f"unknown plan_mode operation: {operation}")
+
     def _project_memory_read(self, parameters: dict[str, Any]) -> ToolResult:
         section = str(parameters.get("section") or "all")
         content = read_project_memory(self.project_root, section=section)
@@ -605,6 +798,32 @@ class ToolExecutor:
         text = data.decode("utf-8", errors="replace")
         return ToolResult("web_search", "OK", f"Searched web for {query}", {"query": query, "html": text[:100000]})
 
+    def _web_browser(self, parameters: dict[str, Any]) -> ToolResult:
+        browser = LightweightBrowser(self.session.dir)
+        operation = _operation(parameters)
+        if operation in {"open", "fetch", "navigate", "load"}:
+            url = str(parameters.get("url") or "")
+            if not url:
+                raise ToolExecutionError("web_browser open requires `url`")
+            page = browser.open(url, timeout=int(parameters.get("timeout", 20)), max_bytes=int(parameters.get("max_bytes", 500000)))
+            return ToolResult(
+                "web_browser",
+                "OK",
+                f"Opened {page.url}",
+                {"url": page.url, "title": page.title, "content_type": page.content_type, "text": page.text[:100000], "links": page.links[:100]},
+            )
+        if operation == "click":
+            index = _optional_int(parameters.get("index"))
+            page = browser.click(index, text=str(parameters.get("text") or ""), href=str(parameters.get("href") or ""), timeout=int(parameters.get("timeout", 20)))
+            return ToolResult("web_browser", "OK", f"Clicked to {page.url}", {"url": page.url, "title": page.title, "text": page.text[:100000], "links": page.links[:100]})
+        if operation == "find":
+            matches = browser.find(str(parameters.get("pattern") or parameters.get("text") or ""))
+            return ToolResult("web_browser", "OK", f"Found {len(matches)} browser match(es)", {"matches": matches})
+        if operation in {"current", "state"}:
+            page = browser.current()
+            return ToolResult("web_browser", "OK", f"Current browser page {page.url}", {"url": page.url, "title": page.title, "text": page.text[:100000], "links": page.links[:100]})
+        raise ToolExecutionError(f"unknown web_browser operation: {operation}")
+
     def _mcp(self, parameters: dict[str, Any]) -> ToolResult:
         tool = str(parameters.get("tool", ""))
         arguments = parameters.get("arguments", {})
@@ -631,6 +850,79 @@ class ToolExecutor:
                 result,
             )
         return ToolResult("mcp", "OK", f"Called MCP tool {tool}", result)
+
+    def _list_mcp_resources(self, parameters: dict[str, Any]) -> ToolResult:
+        server = str(parameters.get("server") or parameters.get("server_name") or "")
+        cursor = str(parameters.get("cursor") or "")
+        try:
+            result = list_mcp_resources(
+                project_root=self.project_root,
+                server_name=server,
+                cursor=cursor,
+                timeout=int(parameters.get("timeout", 45)),
+                extra_servers=self.agent_mcp_servers,
+                additional_dirs=self.additional_dirs,
+            )
+        except MCPBridgeError as exc:
+            return ToolResult("list_mcp_resources", "BLOCKED", str(exc), {"server": server})
+        if isinstance(result.get("results"), list) and not result.get("results") and result.get("errors"):
+            return ToolResult("list_mcp_resources", "BLOCKED", "No configured MCP server returned resources", result)
+        return ToolResult("list_mcp_resources", "OK", "Listed MCP resources", result)
+
+    def _read_mcp_resource(self, parameters: dict[str, Any]) -> ToolResult:
+        uri = str(parameters.get("uri") or parameters.get("url") or "")
+        if not uri:
+            raise ToolExecutionError("read_mcp_resource requires `uri`")
+        server = str(parameters.get("server") or parameters.get("server_name") or "")
+        try:
+            result = read_mcp_resource(
+                project_root=self.project_root,
+                uri=uri,
+                server_name=server,
+                timeout=int(parameters.get("timeout", 45)),
+                extra_servers=self.agent_mcp_servers,
+                additional_dirs=self.additional_dirs,
+            )
+        except MCPBridgeError as exc:
+            return ToolResult("read_mcp_resource", "BLOCKED", str(exc), {"server": server, "uri": uri})
+        return ToolResult("read_mcp_resource", "OK", f"Read MCP resource {uri}", result)
+
+    def _mcp_elicitation(self, parameters: dict[str, Any]) -> ToolResult:
+        operation = _operation(parameters)
+        path = self.session.path("mcp-elicitation.json")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace")) if path.exists() else {"requests": []}
+        except (OSError, ValueError):
+            data = {"requests": []}
+        requests = data.get("requests")
+        if not isinstance(requests, list):
+            requests = []
+        if operation in {"request", "ask", "create"}:
+            request = {
+                "id": str(parameters.get("id") or f"elicitation-{len(requests) + 1:03d}"),
+                "server": str(parameters.get("server") or ""),
+                "message": str(parameters.get("message") or parameters.get("question") or ""),
+                "schema": parameters.get("schema") if isinstance(parameters.get("schema"), dict) else {},
+                "status": "waiting",
+                "created_at": self.session.id,
+            }
+            requests.append(request)
+            path.write_text(json.dumps({"requests": requests}, ensure_ascii=False, indent=2), encoding="utf-8")
+            return ToolResult("mcp_elicitation", "BLOCKED", "MCP elicitation requires a response", {"request": request, "path": str(path)})
+        if operation in {"respond", "answer", "complete"}:
+            request_id = str(parameters.get("id") or parameters.get("request_id") or "")
+            answer = parameters.get("answer", parameters.get("response", parameters.get("content", "")))
+            for request in requests:
+                if isinstance(request, dict) and (not request_id or request.get("id") == request_id):
+                    request["status"] = "answered"
+                    request["answer"] = answer
+                    request["answered_at"] = self.session.id
+                    path.write_text(json.dumps({"requests": requests}, ensure_ascii=False, indent=2), encoding="utf-8")
+                    return ToolResult("mcp_elicitation", "OK", f"Answered MCP elicitation {request.get('id')}", {"request": request, "path": str(path)})
+            raise ToolExecutionError(f"MCP elicitation request not found: {request_id}")
+        if operation in {"list", "load"}:
+            return ToolResult("mcp_elicitation", "OK", f"Loaded {len(requests)} MCP elicitation request(s)", {"requests": requests, "path": str(path)})
+        raise ToolExecutionError(f"unknown mcp_elicitation operation: {operation}")
 
     def _memory_read(self, parameters: dict[str, Any]) -> ToolResult:
         agent = str(parameters.get("agent") or self.agent_name)
@@ -897,10 +1189,32 @@ _TOOL_ALIASES = {
     "MultiEdit": "multi_edit",
     "bash": "bash",
     "Bash": "bash",
+    "powershell": "powershell",
+    "PowerShell": "powershell",
+    "terminalcapture": "terminal_capture",
+    "terminal_capture": "terminal_capture",
+    "TerminalCapture": "terminal_capture",
+    "repl": "repl",
+    "REPL": "repl",
     "task": "task",
     "Task": "task",
     "agent": "agent",
     "Agent": "agent",
+    "taskcreate": "task_create",
+    "task_create": "task_create",
+    "TaskCreate": "task_create",
+    "taskget": "task_get",
+    "task_get": "task_get",
+    "TaskGet": "task_get",
+    "tasklist": "task_list",
+    "task_list": "task_list",
+    "TaskList": "task_list",
+    "taskoutput": "task_output",
+    "task_output": "task_output",
+    "TaskOutput": "task_output",
+    "taskupdate": "task_update",
+    "task_update": "task_update",
+    "TaskUpdate": "task_update",
     "askuserquestion": "ask_user_question",
     "ask_user_question": "ask_user_question",
     "AskUserQuestion": "ask_user_question",
@@ -909,6 +1223,21 @@ _TOOL_ALIASES = {
     "TodoWrite": "todo_write",
     "skill": "skill",
     "Skill": "skill",
+    "toolsearch": "tool_search",
+    "tool_search": "tool_search",
+    "ToolSearch": "tool_search",
+    "enterplanmode": "plan_mode",
+    "enter_plan_mode": "plan_mode",
+    "EnterPlanMode": "plan_mode",
+    "exitplanmode": "plan_mode",
+    "exit_plan_mode": "plan_mode",
+    "ExitPlanMode": "plan_mode",
+    "verifyplanexecution": "plan_mode",
+    "verify_plan_execution": "plan_mode",
+    "VerifyPlanExecution": "plan_mode",
+    "planmode": "plan_mode",
+    "plan_mode": "plan_mode",
+    "PlanMode": "plan_mode",
     "project_memory_read": "project_memory_read",
     "ProjectMemoryRead": "project_memory_read",
     "project_memory_write": "project_memory_write",
@@ -924,8 +1253,22 @@ _TOOL_ALIASES = {
     "websearch": "web_search",
     "web_search": "web_search",
     "WebSearch": "web_search",
+    "webbrowser": "web_browser",
+    "web_browser": "web_browser",
+    "WebBrowser": "web_browser",
     "mcp": "mcp",
     "MCP": "mcp",
+    "listmcpresources": "list_mcp_resources",
+    "list_mcp_resources": "list_mcp_resources",
+    "ListMcpResources": "list_mcp_resources",
+    "ListMcpResourcesTool": "list_mcp_resources",
+    "readmcpresource": "read_mcp_resource",
+    "read_mcp_resource": "read_mcp_resource",
+    "ReadMcpResource": "read_mcp_resource",
+    "ReadMcpResourceTool": "read_mcp_resource",
+    "mcpelicitation": "mcp_elicitation",
+    "mcp_elicitation": "mcp_elicitation",
+    "McpElicitation": "mcp_elicitation",
     "sendmessage": "send_message",
     "send_message": "send_message",
     "SendMessage": "send_message",
@@ -952,18 +1295,32 @@ _CLAUDE_TOOL_NAMES = {
     "edit_file": "Edit",
     "multi_edit": "MultiEdit",
     "bash": "Bash",
+    "powershell": "PowerShell",
+    "terminal_capture": "TerminalCapture",
+    "repl": "REPL",
     "task": "Task",
     "agent": "Agent",
+    "task_create": "TaskCreate",
+    "task_get": "TaskGet",
+    "task_list": "TaskList",
+    "task_output": "TaskOutput",
+    "task_update": "TaskUpdate",
     "ask_user_question": "AskUserQuestion",
     "todo_write": "TodoWrite",
     "skill": "Skill",
+    "tool_search": "ToolSearch",
+    "plan_mode": "PlanMode",
     "project_memory_read": "Read",
     "project_memory_write": "Write",
     "asset_register": "Write",
     "capability_list": "Read",
     "web_fetch": "WebFetch",
     "web_search": "WebSearch",
+    "web_browser": "WebBrowser",
     "mcp": "mcp",
+    "list_mcp_resources": "ListMcpResources",
+    "read_mcp_resource": "ReadMcpResource",
+    "mcp_elicitation": "McpElicitation",
     "send_message": "SendMessage",
     "task_stop": "TaskStop",
     "memory_read": "Read",
@@ -1007,6 +1364,10 @@ def _allowed_by_frontmatter(tool: str, parameters: dict[str, Any], allowed: set[
         claude_tool.lower(),
         tool.replace("_", "-"),
     }
+    if tool.startswith("task_"):
+        candidates.update({"Task", "task"})
+    if tool in {"list_mcp_resources", "read_mcp_resource", "mcp_elicitation"}:
+        candidates.update({"mcp", "MCP"})
     mcp_tool = str(parameters.get("tool") or "")
     if tool == "mcp" and mcp_tool:
         candidates.add(mcp_tool)
@@ -1043,11 +1404,15 @@ def _claude_permission_parameters(tool: str, parameters: dict[str, Any]) -> dict
         return {"path": str(parameters.get("path", ""))}
     if tool == "bash":
         return {"command": str(parameters.get("command", ""))}
+    if tool in {"powershell", "terminal_capture", "repl"}:
+        return {"command": str(parameters.get("command") or parameters.get("code") or "")}
     if tool == "web_fetch":
         return {"url": str(parameters.get("url", ""))}
     if tool == "mcp":
         return {"tool": str(parameters.get("tool", ""))}
-    if tool in {"bridge", "voice", "ide"}:
+    if tool in {"list_mcp_resources", "read_mcp_resource", "mcp_elicitation"}:
+        return {"server": str(parameters.get("server") or ""), "uri": str(parameters.get("uri") or "")}
+    if tool in {"bridge", "voice", "ide", "plan_mode", "web_browser"}:
         return {"operation": str(parameters.get("operation") or parameters.get("action") or "")}
     return parameters
 
@@ -1067,12 +1432,22 @@ def _claude_tool_input(tool: str, parameters: dict[str, Any]) -> dict[str, Any]:
         return {"file_path": str(parameters.get("path", "")), "edits": parameters.get("edits", [])}
     if tool == "bash":
         return {"command": str(parameters.get("command", ""))}
+    if tool == "powershell":
+        return {"command": str(parameters.get("command", ""))}
+    if tool == "terminal_capture":
+        return {"command": parameters.get("command", ""), "shell": str(parameters.get("shell") or "")}
+    if tool == "repl":
+        return {"language": str(parameters.get("language") or "python"), "code": str(parameters.get("code") or "")}
     if tool == "web_fetch":
         return {"url": str(parameters.get("url", ""))}
     if tool == "web_search":
         return {"query": str(parameters.get("query", ""))}
+    if tool == "web_browser":
+        return dict(parameters)
     if tool == "mcp":
         return {"tool": str(parameters.get("tool", "")), "arguments": parameters.get("arguments", {})}
+    if tool in {"list_mcp_resources", "read_mcp_resource", "mcp_elicitation"}:
+        return dict(parameters)
     return dict(parameters)
 
 
@@ -1100,6 +1475,24 @@ def _required(parameters: dict[str, Any], key: str) -> str:
     if not value:
         raise ToolExecutionError(f"missing required parameter `{key}`")
     return value
+
+
+def _task_key(parameters: dict[str, Any]) -> str:
+    value = str(parameters.get("to") or parameters.get("worker_id") or parameters.get("task_id") or parameters.get("id") or "").strip()
+    if not value:
+        raise ToolExecutionError("task operation requires `to`, `worker_id`, `task_id`, or `id`")
+    return value
+
+
+def _plan_operation_from_raw_tool(raw_tool: str) -> str:
+    lowered = raw_tool.strip().lower().replace("-", "_")
+    if lowered in {"enterplanmode", "enter_plan_mode"}:
+        return "enter"
+    if lowered in {"exitplanmode", "exit_plan_mode"}:
+        return "exit"
+    if lowered in {"verifyplanexecution", "verify_plan_execution"}:
+        return "verify"
+    return ""
 
 
 def _optional_int(value: Any) -> int | None:
@@ -1139,6 +1532,17 @@ def _normalize_action_parameters(tool: str, parameters: dict[str, Any]) -> dict[
             if "timeout" in nested and "timeout" not in normalized:
                 normalized["timeout"] = nested["timeout"]
         return normalized
+    if tool == "plan_mode":
+        for alias, operation in {
+            "enter_plan_mode": "enter",
+            "EnterPlanMode": "enter",
+            "exit_plan_mode": "exit",
+            "ExitPlanMode": "exit",
+            "verify_plan_execution": "verify",
+            "VerifyPlanExecution": "verify",
+        }.items():
+            if normalized.get("tool") == alias:
+                normalized["operation"] = operation
     outer_keys = {key for key in normalized if key not in {"arguments", "timeout"}}
     if not outer_keys:
         return {**nested, **{key: value for key, value in normalized.items() if key != "arguments"}}

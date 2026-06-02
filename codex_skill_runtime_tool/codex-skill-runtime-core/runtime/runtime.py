@@ -23,6 +23,7 @@ from .loaders import SkillRepositoryLoader
 from .memdir import MemoryHeader, run_memory_consolidation_job, run_memory_extraction_job, relevant_memory_context
 from .mcp import mcp_instructions_context, servers_from_agent_mcp_specs
 from .memory import agent_memory_context, project_memory_context, record_session_summary, runtime_memory_context
+from .plan_state import plan_mode_context
 from .prompts import agent_task_prompt, qa_prompt, skill_prompt
 from .qa import resolve_qa_agent
 from .questions import answer_pending_question, pending_question_context
@@ -1147,6 +1148,7 @@ class CodexSkillRuntime:
         add_section("capability-context", capability_context(self.project_root, additional_dirs=self.additional_dirs), priority=20)
         add_section("project-memory", project_memory_context(self.project_root), priority=25)
         add_section("compact-state", compact_state_context(session), priority=25)
+        add_section("plan-mode", plan_mode_context(session), priority=25)
         add_section("session-memory", session_memory_context(session), priority=15, required=True)
         add_section("invoked-skills", session.invoked_skills_context(max_chars=20000), priority=15, required=True)
         skill_registry = self.loader.skill_registry_context(

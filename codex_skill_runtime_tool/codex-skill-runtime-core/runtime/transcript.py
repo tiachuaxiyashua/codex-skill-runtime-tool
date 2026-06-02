@@ -9,7 +9,9 @@ from typing import Any, Iterable
 from .api_transcript import api_transcript_context
 from .state_paths import runtime_state_path
 from .memdir import relevant_memory_context
+from .plan_state import plan_mode_context
 from .session_memory import session_memory_context
+from .tool_transcript import tool_transcript_context
 from .workers import worker_scratchpad_context
 
 
@@ -143,6 +145,14 @@ def replay_context(
     api_messages = api_transcript_context(session_dir)
     if api_messages:
         lines.extend(["### API Message Replay", "", api_messages, ""])
+
+    tool_messages = tool_transcript_context(session_dir)
+    if tool_messages:
+        lines.extend(["### Tool Use/Result Replay", "", tool_messages, ""])
+
+    plan_mode = plan_mode_context(session_dir)
+    if plan_mode:
+        lines.extend(["### Plan Mode Replay", "", plan_mode, ""])
 
     lines.append("### Event Timeline")
     for event in _important_events(events)[-120:]:

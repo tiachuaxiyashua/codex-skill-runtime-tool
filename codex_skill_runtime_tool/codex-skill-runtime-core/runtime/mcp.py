@@ -80,6 +80,288 @@ def call_mcp_tool(
     raise MCPBridgeError(f"MCP server `{server.name}` has unsupported transport `{transport}`.")
 
 
+def call_mcp_method(
+    *,
+    project_root: Path,
+    server_name: str,
+    method: str,
+    params: dict[str, Any] | None = None,
+    timeout: int = 45,
+    extra_servers: list[MCPServerConfig] | None = None,
+    additional_dirs: list[Path] | None = None,
+) -> dict[str, Any]:
+    server = _resolve_server(project_root=project_root, server_name=server_name, extra_servers=extra_servers, additional_dirs=additional_dirs)
+    transport = _server_transport(server.config)
+    parameters = params if isinstance(params, dict) else {}
+    if transport == "stdio":
+        return _call_stdio_mcp_method(project_root=project_root, server=server, method=method, params=parameters, timeout=timeout)
+    if transport == "http":
+        return _call_http_mcp_method(project_root=project_root, server=server, method=method, params=parameters, timeout=timeout)
+    if transport == "sse":
+        return _call_sse_mcp_method(project_root=project_root, server=server, method=method, params=parameters, timeout=timeout)
+    if transport == "websocket":
+        return _call_websocket_mcp_method(project_root=project_root, server=server, method=method, params=parameters, timeout=timeout)
+    raise MCPBridgeError(f"MCP server `{server.name}` has unsupported transport `{transport}`.")
+
+
+def list_mcp_resources(
+    *,
+    project_root: Path,
+    server_name: str = "",
+    cursor: str = "",
+    timeout: int = 45,
+    extra_servers: list[MCPServerConfig] | None = None,
+    additional_dirs: list[Path] | None = None,
+) -> dict[str, Any]:
+    params = {"cursor": cursor} if cursor else {}
+    if server_name:
+        return call_mcp_method(
+            project_root=project_root,
+            server_name=server_name,
+            method="resources/list",
+            params=params,
+            timeout=timeout,
+            extra_servers=extra_servers,
+            additional_dirs=additional_dirs,
+        )
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for server in discover_mcp_servers(project_root, extra_servers=extra_servers, additional_dirs=additional_dirs):
+        try:
+            results.append(
+                call_mcp_method(
+                    project_root=project_root,
+                    server_name=server.name,
+                    method="resources/list",
+                    params=params,
+                    timeout=timeout,
+                    extra_servers=extra_servers,
+                    additional_dirs=additional_dirs,
+                )
+            )
+        except Exception as exc:
+            errors.append({"server": server.name, "error": str(exc)})
+    return {"server": "", "method": "resources/list", "results": results, "errors": errors}
+
+
+def read_mcp_resource(
+    *,
+    project_root: Path,
+    uri: str,
+    server_name: str = "",
+    timeout: int = 45,
+    extra_servers: list[MCPServerConfig] | None = None,
+    additional_dirs: list[Path] | None = None,
+) -> dict[str, Any]:
+    if server_name:
+        return call_mcp_method(
+            project_root=project_root,
+            server_name=server_name,
+            method="resources/read",
+            params={"uri": uri},
+            timeout=timeout,
+            extra_servers=extra_servers,
+            additional_dirs=additional_dirs,
+        )
+    errors: list[dict[str, str]] = []
+    for server in discover_mcp_servers(project_root, extra_servers=extra_servers, additional_dirs=additional_dirs):
+        try:
+            result = call_mcp_method(
+                project_root=project_root,
+                server_name=server.name,
+                method="resources/read",
+                params={"uri": uri},
+                timeout=timeout,
+                extra_servers=extra_servers,
+                additional_dirs=additional_dirs,
+            )
+            return result
+        except Exception as exc:
+            errors.append({"server": server.name, "error": str(exc)})
+    raise MCPBridgeError(f"No configured MCP server could read resource `{uri}`. Errors: {errors}")
+
+
+def _call_stdio_mcp_method(
+    *,
+    project_root: Path,
+    server: MCPServerConfig,
+    method: str,
+    params: dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+    if "command" not in server.config:
+        raise MCPBridgeError(f"MCP server `{server.name}` has no command.")
+    command = _expand_env(str(server.config["command"]), project_root=project_root, plugin_root=server.plugin_root)
+    args = [
+        _expand_env(str(value), project_root=project_root, plugin_root=server.plugin_root)
+        for value in server.config.get("args", [])
+    ]
+    env = _stdio_env(project_root=project_root, server=server)
+    process = subprocess.Popen(
+        [command, *args],
+        cwd=str(project_root),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        bufsize=1,
+    )
+    try:
+        _send(process, 1, "initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "codex-skill-runtime", "version": "0.1"}})
+        initialize = _read_response(process, 1, timeout=timeout)
+        _send_notification(process, "notifications/initialized", {})
+        _send(process, 2, method, params)
+        result = _read_response(process, 2, timeout=timeout)
+        return {"server": server.name, "transport": "stdio", "method": method, "initialize": initialize, "result": result}
+    finally:
+        _terminate(process)
+
+
+def _call_http_mcp_method(
+    *,
+    project_root: Path,
+    server: MCPServerConfig,
+    method: str,
+    params: dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+    url = _remote_url(server.config, "http", project_root=project_root, plugin_root=server.plugin_root)
+    headers = _remote_headers(server, project_root=project_root)
+    session_id: str | None = None
+    initialize_payload = _jsonrpc_request(
+        1,
+        "initialize",
+        {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "codex-skill-runtime", "version": "0.1"}},
+    )
+
+    def run_once(active_headers: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any], Any]:
+        initialize, response_headers = _post_json_rpc(url, initialize_payload, headers=active_headers, timeout=timeout, session_id=session_id)
+        active_session = response_headers.get("mcp-session-id") or response_headers.get("Mcp-Session-Id")
+        _post_json_rpc(url, _jsonrpc_notification("notifications/initialized", {}), headers=active_headers, timeout=timeout, session_id=active_session, expect_response=False)
+        result, _ = _post_json_rpc(
+            url,
+            _jsonrpc_request(2, method, params),
+            headers=active_headers,
+            timeout=timeout,
+            session_id=active_session,
+        )
+        return initialize, result, active_session
+
+    try:
+        initialize, result, active_session = run_once(headers)
+    except MCPRemoteAuthError:
+        refreshed = refresh_oauth_token(
+            project_root=project_root,
+            server_name=server.name,
+            config=server.config,
+            plugin_root=server.plugin_root,
+            server_url=url,
+        )
+        if refreshed is None:
+            raise
+        headers = {**headers, "Authorization": refreshed.authorization_header()}
+        initialize, result, active_session = run_once(headers)
+    return {"server": server.name, "transport": "http", "url": _sanitize_url(url), "method": method, "session_id": active_session, "initialize": initialize, "result": result}
+
+
+def _call_sse_mcp_method(
+    *,
+    project_root: Path,
+    server: MCPServerConfig,
+    method: str,
+    params: dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+    url = _remote_url(server.config, "sse", project_root=project_root, plugin_root=server.plugin_root)
+    headers = _remote_headers(server, project_root=project_root)
+
+    def run_once(active_headers: dict[str, str]) -> dict[str, Any]:
+        stream = _SSEClient(url, headers=active_headers, timeout=timeout)
+        try:
+            endpoint = stream.wait_endpoint()
+            _post_sse_message(
+                endpoint,
+                _jsonrpc_request(1, "initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "codex-skill-runtime", "version": "0.1"}}),
+                headers=active_headers,
+                timeout=timeout,
+            )
+            initialize = stream.wait_response(1)
+            _post_sse_message(endpoint, _jsonrpc_notification("notifications/initialized", {}), headers=active_headers, timeout=timeout)
+            _post_sse_message(endpoint, _jsonrpc_request(2, method, params), headers=active_headers, timeout=timeout)
+            result = stream.wait_response(2)
+            return {"server": server.name, "transport": "sse", "url": _sanitize_url(url), "method": method, "initialize": initialize, "result": result}
+        finally:
+            stream.close()
+
+    try:
+        return run_once(headers)
+    except MCPRemoteAuthError:
+        refreshed = refresh_oauth_token(
+            project_root=project_root,
+            server_name=server.name,
+            config=server.config,
+            plugin_root=server.plugin_root,
+            server_url=url,
+        )
+        if refreshed is None:
+            raise
+        headers = {**headers, "Authorization": refreshed.authorization_header()}
+        return run_once(headers)
+
+
+def _call_websocket_mcp_method(
+    *,
+    project_root: Path,
+    server: MCPServerConfig,
+    method: str,
+    params: dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+    try:
+        import websocket  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise MCPBridgeError(
+            f"MCP server `{server.name}` uses WebSocket, but Python package `websocket-client` is not installed."
+        ) from exc
+    url = _remote_url(server.config, "websocket", project_root=project_root, plugin_root=server.plugin_root)
+    headers = _remote_headers(server, project_root=project_root)
+
+    def run_once(active_headers: dict[str, str]) -> dict[str, Any]:
+        header_lines = [f"{key}: {value}" for key, value in active_headers.items()]
+        ws = websocket.create_connection(url, header=header_lines, timeout=timeout)
+        try:
+            ws.send(json.dumps(_jsonrpc_request(1, "initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "codex-skill-runtime", "version": "0.1"}}), ensure_ascii=False))
+            initialize = _websocket_wait_response(ws, 1, timeout=timeout)
+            ws.send(json.dumps(_jsonrpc_notification("notifications/initialized", {}), ensure_ascii=False))
+            ws.send(json.dumps(_jsonrpc_request(2, method, params), ensure_ascii=False))
+            result = _websocket_wait_response(ws, 2, timeout=timeout)
+            return {"server": server.name, "transport": "websocket", "url": _sanitize_url(url), "method": method, "initialize": initialize, "result": result}
+        finally:
+            ws.close()
+
+    try:
+        return run_once(headers)
+    except Exception as exc:
+        if not _websocket_auth_error(exc):
+            raise
+        refreshed = refresh_oauth_token(
+            project_root=project_root,
+            server_name=server.name,
+            config=server.config,
+            plugin_root=server.plugin_root,
+            server_url=url,
+        )
+        if refreshed is None:
+            raise MCPRemoteAuthError(
+                f"Remote WebSocket MCP server {_sanitize_url(url)} requires authentication or authorization."
+            ) from exc
+        headers = {**headers, "Authorization": refreshed.authorization_header()}
+        return run_once(headers)
+
+
 def _call_stdio_mcp_tool(
     *,
     project_root: Path,
@@ -96,12 +378,7 @@ def _call_stdio_mcp_tool(
         _expand_env(str(value), project_root=project_root, plugin_root=server.plugin_root)
         for value in server.config.get("args", [])
     ]
-    env = dict(os.environ)
-    if server.plugin_root is not None:
-        env["CLAUDE_PLUGIN_ROOT"] = str(server.plugin_root)
-    env["CLAUDE_PROJECT_DIR"] = str(project_root)
-    for key, value in server.config.get("env", {}).items():
-        env[str(key)] = _expand_env(str(value), project_root=project_root, plugin_root=server.plugin_root)
+    env = _stdio_env(project_root=project_root, server=server)
 
     process = subprocess.Popen(
         [command, *args],
@@ -432,6 +709,36 @@ def _resolve_tool(
             return server, tool_name
     available = sorted(alias for server in servers for alias in server.aliases)
     raise MCPBridgeError(f"No MCP server configured for `{server_alias}`. Available server aliases: {available}")
+
+
+def _resolve_server(
+    *,
+    project_root: Path,
+    server_name: str,
+    extra_servers: list[MCPServerConfig] | None = None,
+    additional_dirs: list[Path] | None = None,
+) -> MCPServerConfig:
+    clean = server_name.strip()
+    if clean.startswith("mcp__"):
+        clean = clean.removeprefix("mcp__").split("__", 1)[0]
+    servers = discover_mcp_servers(project_root, extra_servers=extra_servers, additional_dirs=additional_dirs)
+    for server in servers:
+        if clean == server.name or clean in server.aliases:
+            return server
+    available = sorted(alias for server in servers for alias in server.aliases)
+    raise MCPBridgeError(f"No MCP server configured for `{server_name}`. Available server aliases: {available}")
+
+
+def _stdio_env(*, project_root: Path, server: MCPServerConfig) -> dict[str, str]:
+    env = dict(os.environ)
+    if server.plugin_root is not None:
+        env["CLAUDE_PLUGIN_ROOT"] = str(server.plugin_root)
+    env["CLAUDE_PROJECT_DIR"] = str(project_root)
+    raw_env = server.config.get("env", {})
+    if isinstance(raw_env, dict):
+        for key, value in raw_env.items():
+            env[str(key)] = _expand_env(str(value), project_root=project_root, plugin_root=server.plugin_root)
+    return env
 
 
 def _is_remote_server(config: dict[str, Any]) -> bool:

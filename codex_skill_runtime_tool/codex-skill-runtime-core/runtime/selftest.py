@@ -110,9 +110,14 @@ class SelfTester:
             self._mcp_bridge_contract,
             self._compat_gap_contract,
             self._worker_registry_contract,
+            self._task_tool_family_contract,
             self._worker_scratchpad_contract,
+            self._tool_search_contract,
+            self._plan_terminal_browser_contract,
+            self._mcp_resource_contract,
             self._large_tool_result_contract,
             self._api_message_transcript_contract,
+            self._structured_tool_transcript_contract,
             self._model_effort_command_contract,
             self._codex_api_proxy_config_contract,
             self._isolated_runtime_env_contract,
@@ -164,7 +169,7 @@ class SelfTester:
         self._assert(len(skills) >= 70, f"expected >=70 skills, found {len(skills)}")
         self._assert(len(agents) >= 45, f"expected >=45 agents, found {len(agents)}")
         for skill in ["prototype", "team-qa", "setup-engine", "dev-story"]:
-            self._assert(skill in skills or f"ccgs:{skill}" in skills, f"missing skill {skill}")
+            self._assert(skill in skills or any(name.endswith(f":{skill}") for name in skills), f"missing skill {skill}")
         for agent in ["prototyper", "qa-tester", "qa-lead"]:
             self._assert(agent in agents, f"missing agent {agent}")
         return f"skills={len(skills)} agents={len(agents)}"
@@ -432,10 +437,10 @@ class SelfTester:
 
     def _skill_registry_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-skill-registry")
-        ccgs_root = session.path("multi-root", "ccgs")
+        primary_root = session.path("multi-root", "primary")
         art_root = session.path("multi-root", "art-plugin")
-        (ccgs_root / "skills" / "start").mkdir(parents=True, exist_ok=True)
-        (ccgs_root / "skills" / "start" / "SKILL.md").write_text(
+        (primary_root / "skills" / "start").mkdir(parents=True, exist_ok=True)
+        (primary_root / "skills" / "start" / "SKILL.md").write_text(
             "---\nname: start\ndescription: Start a game workflow.\n---\nStart workflow.",
             encoding="utf-8",
         )
@@ -451,17 +456,17 @@ class SelfTester:
         )
 
         old = os.environ.get("SKILL_RUNTIME_NAMESPACES")
-        os.environ["SKILL_RUNTIME_NAMESPACES"] = f"ccgs={ccgs_root}"
+        os.environ["SKILL_RUNTIME_NAMESPACES"] = f"primary={primary_root}"
         try:
-            loader = SkillRepositoryLoader(ccgs_root, additional_dirs=[art_root], bare=True)
+            loader = SkillRepositoryLoader(primary_root, additional_dirs=[art_root], bare=True)
             skills = loader.list_skills()
-            self._assert("ccgs:start" in skills, "root namespace did not expose ccgs:start")
+            self._assert("primary:start" in skills, "root namespace did not expose primary:start")
             self._assert("art:generate-sprite" in skills, "plugin namespace did not expose art:generate-sprite")
-            self._assert(loader.load_skill("ccgs:start").path.name == "SKILL.md", "namespaced root skill did not load")
+            self._assert(loader.load_skill("primary:start").path.name == "SKILL.md", "namespaced root skill did not load")
             self._assert(loader.load_skill_by_reference("art:generate-sprite").path.name == "SKILL.md", "namespaced plugin skill did not load")
             registry = loader.skill_registry_context(max_chars=600)
             self._assert("Runtime SkillTool Registry" in registry, "skill registry context missing")
-            self._assert("ccgs:start" in registry and "art:generate-sprite" in registry, "skill registry omitted namespaced skills")
+            self._assert("primary:start" in registry and "art:generate-sprite" in registry, "skill registry omitted namespaced skills")
             self._assert("full SKILL.md content is loaded only through the `skill` action" in registry, "SkillTool contract missing")
         finally:
             if old is None:
@@ -1659,6 +1664,166 @@ class SelfTester:
         self._assert(described and described[0].get("status") == "stopped", "persisted worker status was not restored")
         return f"session={session.id}"
 
+    def _task_tool_family_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-task-tools")
+
+        def runner(agent: str, purpose: str, prompt: str, index: int) -> str:
+            return f"TASK_TOOL_OUTPUT:{agent}:{purpose}:{index}:{prompt[-20:]}"
+
+        registry = WorkerRegistry(runner, session_dir=session.dir)
+        executor = ToolExecutor(
+            project_root=self.project_root,
+            hooks=HookDispatcher([], self.project_root),
+            session=session,
+            assume_yes=True,
+            worker_registry=registry,
+        )
+        created = executor.execute({"tool": "TaskCreate", "parameters": {"agent": "worker", "purpose": "coverage", "prompt": "produce task output", "name": "coverage-worker"}})
+        self._assert(created.status == "OK" and created.data.get("worker_id") == "worker-001", "TaskCreate did not create worker")
+        listed = executor.execute({"tool": "TaskList", "parameters": {}})
+        self._assert(listed.status == "OK" and listed.data.get("workers"), "TaskList did not return workers")
+        got = executor.execute({"tool": "TaskGet", "parameters": {"task_id": "coverage-worker"}})
+        self._assert(got.status == "OK" and got.data.get("worker", {}).get("id") == "worker-001", "TaskGet did not resolve named worker")
+        output = executor.execute({"tool": "TaskOutput", "parameters": {"task_id": "worker-001", "full": True}})
+        self._assert(output.status == "OK" and "TASK_TOOL_OUTPUT" in output.data.get("output", ""), "TaskOutput did not return worker output")
+        updated = executor.execute({"tool": "TaskUpdate", "parameters": {"task_id": "worker-001", "status": "reviewing"}})
+        self._assert(updated.status == "OK" and updated.data.get("worker", {}).get("status") == "reviewing", "TaskUpdate did not update status")
+        stopped = executor.execute({"tool": "TaskStop", "parameters": {"task_id": "worker-001", "reason": "contract complete"}})
+        self._assert(stopped.status == "OK" and stopped.data.get("status") == "stopped", "TaskStop did not stop worker")
+        allowed_executor = ToolExecutor(
+            project_root=self.project_root,
+            hooks=HookDispatcher([], self.project_root),
+            session=session,
+            assume_yes=False,
+            worker_registry=registry,
+            allowed_tools=["Task"],
+        )
+        allowed = allowed_executor.execute({"tool": "TaskCreate", "parameters": {"agent": "worker", "purpose": "allowed", "prompt": "allowed task"}})
+        self._assert(allowed.status == "OK", "allowed-tools Task should permit TaskCreate family")
+        return f"session={session.id}"
+
+    def _tool_search_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-tool-search")
+        executor = ToolExecutor(
+            project_root=self.project_root,
+            hooks=HookDispatcher([], self.project_root),
+            session=session,
+            assume_yes=True,
+        )
+        result = executor.execute({"tool": "ToolSearch", "parameters": {"query": "task worker output", "limit": 10}})
+        self._assert(result.status == "OK", "ToolSearch failed")
+        rows = result.data.get("results", [])
+        names = {row.get("name") for row in rows if isinstance(row, dict)}
+        self._assert("task_output" in names or "task_create" in names, "ToolSearch did not return task tools")
+        self._assert(all("Skill Body" not in json.dumps(row, ensure_ascii=False) for row in rows), "ToolSearch leaked full skill bodies")
+        skill_result = executor.execute({"tool": "tool_search", "parameters": {"query": "prototype", "limit": 20}})
+        self._assert(skill_result.status == "OK", "snake_case tool_search failed")
+        self._assert(any(row.get("kind") == "skill" for row in skill_result.data.get("results", []) if isinstance(row, dict)), "ToolSearch did not include visible skills")
+        return f"session={session.id}"
+
+    def _plan_terminal_browser_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-plan-terminal-browser")
+        executor = ToolExecutor(
+            project_root=self.project_root,
+            hooks=HookDispatcher([], self.project_root),
+            session=session,
+            assume_yes=True,
+        )
+        entered = executor.execute({"tool": "EnterPlanMode", "parameters": {"plan": "1. probe\n2. verify", "reason": "contract"}})
+        self._assert(entered.status == "OK" and entered.data.get("mode") == "plan", "EnterPlanMode failed")
+        exited = executor.execute({"tool": "ExitPlanMode", "parameters": {"approved": True}})
+        self._assert(exited.status == "OK" and exited.data.get("mode") == "execute", "ExitPlanMode failed")
+        verified = executor.execute({"tool": "VerifyPlanExecution", "parameters": {"evidence": {"tasks": [{"status": "done"}]}}})
+        self._assert(verified.status == "OK" and verified.data.get("verified") is True, "VerifyPlanExecution failed")
+        self._assert((session.dir / "plan-mode.json").exists(), "plan-mode.json was not persisted")
+
+        terminal = executor.execute({"tool": "terminal_capture", "parameters": {"command": [sys.executable, "-c", "print('TERMINAL_CAPTURE_MARKER')"], "timeout": 10}})
+        self._assert(terminal.status == "OK" and "TERMINAL_CAPTURE_MARKER" in terminal.data.get("stdout", ""), "terminal_capture failed")
+        self._assert(Path(terminal.data.get("capture", "")).exists(), "terminal capture file missing")
+        repl = executor.execute({"tool": "repl", "parameters": {"code": "print('REPL_MARKER')"}})
+        self._assert(repl.status == "OK" and "REPL_MARKER" in repl.data.get("stdout", ""), "repl failed")
+        power = executor.execute({"tool": "powershell", "parameters": {"command": "Write-Output POWERSHELL_MARKER", "timeout": 10}})
+        if power.status == "OK":
+            self._assert("POWERSHELL_MARKER" in power.data.get("stdout", ""), "powershell stdout missing marker")
+
+        class BrowserHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args) -> None:  # noqa: A002
+                return
+
+            def do_GET(self) -> None:
+                if self.path == "/next":
+                    body = "<html><title>Next</title><body>NEXT_PAGE_MARKER</body></html>"
+                else:
+                    body = "<html><title>Home</title><body>HOME_MARKER <a href='/next'>Next page</a></body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(body.encode("utf-8"))
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), BrowserHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/"
+            opened = executor.execute({"tool": "web_browser", "parameters": {"operation": "open", "url": url, "timeout": 10}})
+            self._assert(opened.status == "OK" and "HOME_MARKER" in opened.data.get("text", ""), "web_browser open failed")
+            found = executor.execute({"tool": "web_browser", "parameters": {"operation": "find", "pattern": "HOME_MARKER"}})
+            self._assert(found.status == "OK" and found.data.get("matches"), "web_browser find failed")
+            clicked = executor.execute({"tool": "web_browser", "parameters": {"operation": "click", "text": "Next page", "timeout": 10}})
+            self._assert(clicked.status == "OK" and "NEXT_PAGE_MARKER" in clicked.data.get("text", ""), "web_browser click failed")
+        finally:
+            server.shutdown()
+            server.server_close()
+        return f"session={session.id}"
+
+    def _mcp_resource_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-mcp-resources")
+        mcp_root = session.path("mcp-resource-root")
+        mcp_root.mkdir(parents=True, exist_ok=True)
+        server_path = mcp_root / "resource_mcp_server.py"
+        server_path.write_text(
+            "\n".join(
+                [
+                    "import json, sys",
+                    "for line in sys.stdin:",
+                    "    if not line.strip():",
+                    "        continue",
+                    "    req = json.loads(line)",
+                    "    method = req.get('method')",
+                    "    if method == 'initialize':",
+                    "        print(json.dumps({'jsonrpc':'2.0','id':req.get('id'),'result':{'protocolVersion':'2024-11-05','capabilities':{'resources':{}},'serverInfo':{'name':'resource','version':'1'}}}), flush=True)",
+                    "    elif method == 'resources/list':",
+                    "        print(json.dumps({'jsonrpc':'2.0','id':req.get('id'),'result':{'resources':[{'uri':'memory://probe','name':'Probe'}]}}), flush=True)",
+                    "    elif method == 'resources/read':",
+                    "        uri = req.get('params', {}).get('uri')",
+                    "        print(json.dumps({'jsonrpc':'2.0','id':req.get('id'),'result':{'contents':[{'uri':uri,'mimeType':'text/plain','text':'MCP_RESOURCE_MARKER'}]}}), flush=True)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (mcp_root / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"resourceEcho": {"command": sys.executable, "args": [str(server_path)]}}}),
+            encoding="utf-8",
+        )
+        executor = ToolExecutor(
+            project_root=mcp_root,
+            hooks=HookDispatcher([], mcp_root),
+            session=session,
+            assume_yes=True,
+        )
+        listed = executor.execute({"tool": "ListMcpResources", "parameters": {"server": "resourceEcho", "timeout": 10}})
+        self._assert(listed.status == "OK", f"ListMcpResources failed: {listed.summary}")
+        resources = listed.data.get("result", {}).get("resources", [])
+        self._assert(resources and resources[0].get("uri") == "memory://probe", "MCP resources/list returned unexpected resources")
+        read = executor.execute({"tool": "ReadMcpResource", "parameters": {"server": "resourceEcho", "uri": "memory://probe", "timeout": 10}})
+        self._assert(read.status == "OK", f"ReadMcpResource failed: {read.summary}")
+        self._assert("MCP_RESOURCE_MARKER" in json.dumps(read.data, ensure_ascii=False), "MCP resource content missing")
+        elicitation = executor.execute({"tool": "mcp_elicitation", "parameters": {"operation": "request", "id": "need-input", "message": "Need input"}})
+        self._assert(elicitation.status == "BLOCKED", "mcp_elicitation request should block")
+        answered = executor.execute({"tool": "mcp_elicitation", "parameters": {"operation": "respond", "id": "need-input", "answer": {"ok": True}}})
+        self._assert(answered.status == "OK", "mcp_elicitation response failed")
+        return f"session={session.id}"
+
     def _worker_scratchpad_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-worker-scratchpad")
 
@@ -1714,6 +1879,24 @@ class SelfTester:
         self._assert("API Message Transcript" in context, "api transcript context missing")
         replay = replay_context(self.project_root, session.id)
         self._assert("API_TRANSCRIPT_USER_MARKER" in replay, "replay did not include API message transcript")
+        return f"session={session.id}"
+
+    def _structured_tool_transcript_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-tool-transcript")
+        executor = ToolExecutor(
+            project_root=self.project_root,
+            hooks=HookDispatcher([], self.project_root),
+            session=session,
+            assume_yes=True,
+        )
+        result = executor.execute({"tool": "read_file", "parameters": {"path": "README.md", "max_chars": 1000}})
+        self._assert(result.status == "OK", "read_file for tool transcript failed")
+        transcript_path = session.dir / "tool-transcript.jsonl"
+        self._assert(transcript_path.exists(), "tool-transcript.jsonl missing")
+        text = transcript_path.read_text(encoding="utf-8", errors="replace")
+        self._assert('"event": "tool_use"' in text and '"event": "tool_result"' in text, "tool transcript missing use/result records")
+        replay = replay_context(self.project_root, session.id)
+        self._assert("Structured Tool Transcript" in replay, "replay did not include structured tool transcript")
         return f"session={session.id}"
 
     def _model_effort_command_contract(self) -> str:

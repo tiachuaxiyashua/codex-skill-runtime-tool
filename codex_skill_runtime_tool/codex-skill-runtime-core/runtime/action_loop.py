@@ -265,10 +265,19 @@ Available tools:
 - edit_file: parameters `path`, `old`, `new`
 - multi_edit: parameters `path`, `edits` where edits is a list of objects with `old` and `new`
 - bash: parameters `command`, optional `timeout`
-- task or agent: parameters `agent`, `purpose`, `prompt`
+- powershell: parameters `command`, optional `timeout`
+- terminal_capture: parameters `command`, optional `shell`, optional `timeout`; persists stdout/stderr evidence
+- repl: parameters `language` (`python`), `code`
+- task or agent or task_create: parameters `agent`, `purpose`, `prompt`, optional `name`
+- task_get: parameters `to` or `worker_id` or `task_id`
+- task_list: optional `status`
+- task_output: parameters `to` or `worker_id` or `task_id`, optional `full`, optional `max_chars`
+- task_update: parameters `to` or `worker_id` or `task_id`, optional `message`, `status`, `purpose`, `name`
 - ask_user_question: parameters `question`, optional `options`, optional `default`
 - todo_write: parameters `items` list, or `todos` list
 - skill: parameters `name`, optional `arguments`; loads another model-invocable skill by name
+- tool_search: parameters `query`, optional `limit`; searches runtime tools, visible skills, capabilities, and MCP servers
+- plan_mode: parameters `operation` enter/exit/verify plus plan/evidence fields; aliases EnterPlanMode/ExitPlanMode/VerifyPlanExecution also route here
 - project_memory_read: parameters optional `section`; reads runtime-owned global style, asset manifest, or project notes
 - project_memory_write: parameters `section`, `content`, optional `append`; writes runtime-owned global style or project notes
 - asset_register: parameters `asset` object; appends one generated or imported asset record to runtime-owned asset manifest
@@ -282,7 +291,11 @@ Available tools:
 - ide: parameters `operation`; supports selection/diagnostics/lsp_command/load context
 - web_fetch: parameters `url`
 - web_search: parameters `query`
+- web_browser: parameters `operation` open/click/find/current; provides a lightweight stateful browser
 - mcp: parameters `tool`, optional `arguments`; supports configured stdio, HTTP, SSE, and WebSocket MCP servers. Remote OAuth uses stored tokens, headers, headersHelper, authCommand/tokenCommand/refreshCommand, and explicit BLOCKED results when user authorization material is still missing.
+- list_mcp_resources: optional `server`, optional `cursor`
+- read_mcp_resource: parameters `uri`, optional `server`
+- mcp_elicitation: parameters `operation` request/respond/list; records elicitation pause/answer lifecycle
 
 Return `status: action_required` with actions when you need runtime work.
 Return `status: final` only when the workflow has enough evidence to stop.

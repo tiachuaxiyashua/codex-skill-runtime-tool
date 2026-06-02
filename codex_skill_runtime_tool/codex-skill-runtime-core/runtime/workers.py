@@ -88,6 +88,54 @@ class WorkerRegistry:
         self._save()
         return record
 
+    def get(self, to: str) -> WorkerRecord:
+        return self._find(to)
+
+    def output(self, to: str, *, full: bool = False, max_chars: int = 20000) -> dict[str, object]:
+        record = self._find(to)
+        if full:
+            turns = record.turns
+            text = "\n\n".join(
+                f"Prompt:\n{turn.get('prompt', '')}\n\nOutput:\n{turn.get('output', '')}"
+                for turn in turns
+            )
+        else:
+            text = record.latest_output
+            turns = record.turns[-1:] if record.turns else []
+        truncated = len(text) > max_chars
+        return {
+            "worker": asdict(record),
+            "turns": turns,
+            "output": text[:max_chars],
+            "truncated": truncated,
+        }
+
+    def update(
+        self,
+        *,
+        to: str,
+        prompt: str = "",
+        status: str = "",
+        purpose: str = "",
+        name: str | None = None,
+    ) -> WorkerRecord:
+        if prompt:
+            return self.send(to=to, prompt=prompt)
+        record = self._find(to)
+        if status:
+            record.status = status
+        if purpose:
+            record.purpose = purpose
+        if name is not None:
+            if record.name:
+                self._names.pop(record.name, None)
+            record.name = name or None
+            if record.name:
+                self._names[record.name] = record.id
+        record.updated_at = datetime.now().isoformat(timespec="seconds")
+        self._save()
+        return record
+
     def describe(self) -> list[dict[str, str]]:
         rows = []
         for record in self._records.values():

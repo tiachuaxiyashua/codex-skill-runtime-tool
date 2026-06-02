@@ -25,6 +25,7 @@ class ContextBudgetResult:
     estimated_tokens_before: int
     estimated_tokens_after: int
     target_tokens: int | None
+    context_window_tokens: int | None
     omitted: list[str]
 
 
@@ -65,6 +66,7 @@ def apply_context_budget(
             estimated_tokens_before=before,
             estimated_tokens_after=before,
             target_tokens=None,
+            context_window_tokens=None,
             omitted=[],
         )
 
@@ -111,6 +113,7 @@ def apply_context_budget(
         estimated_tokens_before=before,
         estimated_tokens_after=after,
         target_tokens=target,
+        context_window_tokens=context_window,
         omitted=omitted,
     )
 

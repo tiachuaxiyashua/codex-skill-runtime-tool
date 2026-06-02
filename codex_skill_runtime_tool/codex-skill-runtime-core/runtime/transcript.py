@@ -6,9 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from .api_transcript import api_transcript_context
 from .state_paths import runtime_state_path
 from .memdir import relevant_memory_context
 from .session_memory import session_memory_context
+from .workers import worker_scratchpad_context
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,14 @@ def replay_context(
                 f"status={worker.get('status', '')} updated={worker.get('updated_at', '')}"
             )
         lines.append("")
+
+    scratchpads = worker_scratchpad_context(session_dir)
+    if scratchpads:
+        lines.extend(["### Worker Scratchpad Context", "", scratchpads, ""])
+
+    api_messages = api_transcript_context(session_dir)
+    if api_messages:
+        lines.extend(["### API Message Replay", "", api_messages, ""])
 
     lines.append("### Event Timeline")
     for event in _important_events(events)[-120:]:

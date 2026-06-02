@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+import threading
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .state_paths import runtime_state_path
 
@@ -18,6 +20,8 @@ MAX_MEMORY_LINES = 200
 MAX_MEMORY_BYTES = 4096
 DEFAULT_CONSOLIDATION_HOURS = 24
 DEFAULT_CONSOLIDATION_SESSIONS = 5
+
+MemorySideQuerySelector = Callable[[str, list["MemoryHeader"], str, list[str]], list[str] | None]
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,7 @@ def relevant_memory_context(
     *,
     query: str,
     recent_tools: list[str] | None = None,
+    selector: MemorySideQuerySelector | None = None,
     limit: int = MAX_RELEVANT_MEMORIES,
     max_lines: int = MAX_MEMORY_LINES,
     max_bytes: int = MAX_MEMORY_BYTES,
@@ -102,6 +107,7 @@ def relevant_memory_context(
         project_root,
         query=query,
         recent_tools=recent_tools or [],
+        selector=selector,
         limit=limit,
     )
     for item in selected:
@@ -127,11 +133,21 @@ def find_relevant_memories(
     *,
     query: str,
     recent_tools: list[str] | None = None,
+    selector: MemorySideQuerySelector | None = None,
     limit: int = MAX_RELEVANT_MEMORIES,
 ) -> list[MemoryHeader]:
     headers = scan_memory_files(project_root)
     if not headers:
         return []
+    selected = _side_query_selected_headers(
+        query=query,
+        headers=headers,
+        selector=selector,
+        recent_tools=recent_tools or [],
+        limit=limit,
+    )
+    if selected is not None:
+        return selected
     query_terms = set(_terms(query))
     tool_terms = set(_terms(" ".join(recent_tools or [])))
     scored: list[tuple[int, MemoryHeader]] = []
@@ -147,6 +163,35 @@ def find_relevant_memories(
             scored.append((score, item))
     scored.sort(key=lambda pair: (pair[0], pair[1].mtime), reverse=True)
     return [item for _, item in scored[:limit]]
+
+
+def _side_query_selected_headers(
+    *,
+    query: str,
+    headers: list[MemoryHeader],
+    selector: MemorySideQuerySelector | None,
+    recent_tools: list[str],
+    limit: int,
+) -> list[MemoryHeader] | None:
+    if selector is None:
+        return None
+    manifest = format_memory_manifest(headers)
+    try:
+        filenames = selector(query, headers[:MAX_MEMORY_FILES], manifest, recent_tools)
+    except Exception:
+        return None
+    if not isinstance(filenames, list):
+        return None
+    by_name = {item.filename: item for item in headers}
+    selected: list[MemoryHeader] = []
+    for filename in filenames:
+        item = by_name.get(str(filename))
+        if item is None or item in selected:
+            continue
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def extract_session_memories(
@@ -195,6 +240,45 @@ def extract_session_memories(
     return [path]
 
 
+def run_memory_extraction_job(
+    project_root: Path,
+    session: Any,
+    *,
+    command: str,
+    arguments: str,
+    status: str,
+    notes: str,
+    gates: list[Any] | None = None,
+    background: bool = False,
+) -> Path:
+    job_path = _create_memory_job(project_root, kind="extract", session_id=str(getattr(session, "id", "")))
+
+    def worker() -> None:
+        _update_memory_job(job_path, status="running")
+        try:
+            outputs = extract_session_memories(
+                project_root,
+                session,
+                command=command,
+                arguments=arguments,
+                status=status,
+                notes=notes,
+                gates=gates,
+            )
+        except Exception as exc:
+            _update_memory_job(job_path, status="failed", error=str(exc))
+            return
+        _update_memory_job(job_path, status="completed", outputs=[str(path) for path in outputs])
+
+    if background:
+        _update_memory_job(job_path, status="queued-background")
+        thread = threading.Thread(target=worker, name=f"memory-extract-{job_path.stem}", daemon=True)
+        thread.start()
+    else:
+        worker()
+    return job_path
+
+
 def consolidate_memories(
     project_root: Path,
     *,
@@ -229,6 +313,68 @@ def consolidate_memories(
         encoding="utf-8",
     )
     return path
+
+
+def run_memory_consolidation_job(
+    project_root: Path,
+    *,
+    force: bool = False,
+    background: bool = False,
+) -> Path:
+    job_path = _create_memory_job(project_root, kind="consolidate", session_id="")
+
+    def worker() -> None:
+        _update_memory_job(job_path, status="running")
+        try:
+            output = consolidate_memories(project_root, force=force)
+        except Exception as exc:
+            _update_memory_job(job_path, status="failed", error=str(exc))
+            return
+        _update_memory_job(job_path, status="completed", outputs=[str(output)] if output is not None else [])
+
+    if background:
+        _update_memory_job(job_path, status="queued-background")
+        thread = threading.Thread(target=worker, name=f"memory-consolidate-{job_path.stem}", daemon=True)
+        thread.start()
+    else:
+        worker()
+    return job_path
+
+
+def _create_memory_job(project_root: Path, *, kind: str, session_id: str) -> Path:
+    jobs = memory_root(project_root) / "jobs"
+    jobs.mkdir(parents=True, exist_ok=True)
+    job_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{kind}-{uuid.uuid4().hex[:8]}"
+    path = jobs / f"{job_id}.json"
+    payload = {
+        "id": job_id,
+        "kind": kind,
+        "session_id": session_id,
+        "status": "queued",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "outputs": [],
+        "error": "",
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _update_memory_job(path: Path, *, status: str, outputs: list[str] | None = None, error: str = "") -> None:
+    data = _load_json(path)
+    if not isinstance(data, dict):
+        data = {}
+    data.update(
+        {
+            "status": status,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    if outputs is not None:
+        data["outputs"] = outputs
+    if error:
+        data["error"] = error
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _write_memory_overview(project_root: Path, *, sessions: list[dict[str, Any]] | None = None) -> Path:

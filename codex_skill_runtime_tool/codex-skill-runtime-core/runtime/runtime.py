@@ -12,16 +12,19 @@ from .action_loop import StrictActionLoop
 from .bridge import bridge_context
 from .capabilities import capability_context, discover_capabilities
 from .compat import agent_memory_scope, agent_skill_references, invocation_profile
+from .compact_state import compact_state_context, record_compact_state
 from .codex_cli import CodexCLI, CodexRunResult
 from .frontmatter import MarkdownDocument
 from .gates import GateResult, evaluate_qa_report
 from .hooks import HookDispatcher, hook_block_reason
 from .ide import ide_context
+from .jsonutil import parse_json_response
 from .loaders import SkillRepositoryLoader
-from .memdir import consolidate_memories, extract_session_memories, relevant_memory_context
+from .memdir import MemoryHeader, run_memory_consolidation_job, run_memory_extraction_job, relevant_memory_context
 from .mcp import mcp_instructions_context, servers_from_agent_mcp_specs
 from .memory import agent_memory_context, project_memory_context, record_session_summary, runtime_memory_context
 from .prompts import agent_task_prompt, qa_prompt, skill_prompt
+from .qa import resolve_qa_agent
 from .questions import answer_pending_question, pending_question_context
 from .session import RuntimeSession
 from .session_memory import maybe_update_session_memory, session_memory_context
@@ -75,6 +78,7 @@ class CodexSkillRuntime:
         self.custom_system_prompt = resolve_system_prompt_value(system_prompt, project_root=self.project_root)
         self.append_system_prompt = resolve_append_system_prompt_value(append_system_prompt, project_root=self.project_root)
         self.loader = SkillRepositoryLoader(self.project_root, additional_dirs=self.additional_dirs)
+        self._side_query_counter = 0
         self.hooks = HookDispatcher(
             self.loader.settings_candidates(),
             self.project_root,
@@ -229,6 +233,8 @@ class CodexSkillRuntime:
                 session=session,
                 target_path=self._infer_target_path(arguments, parent_result),
                 parent_result=parent_result,
+                skill=skill,
+                agent=agent,
             )
             tasks.append(qa_result)
             if self.dry_run:
@@ -414,6 +420,8 @@ class CodexSkillRuntime:
                 session=session,
                 target_path=self._infer_target_path(arguments, loop_result.final),
                 parent_result=loop_result.final,
+                skill=skill,
+                agent=agent,
             )
             tasks.append(qa_result)
             gates.append(evaluate_qa_report(qa_result.last_message))
@@ -954,27 +962,41 @@ class CodexSkillRuntime:
         session: RuntimeSession,
         target_path: str,
         parent_result: str,
+        skill: MarkdownDocument | None = None,
+        agent: MarkdownDocument | None = None,
     ) -> CodexRunResult:
+        qa_resolution = resolve_qa_agent(
+            self.project_root,
+            skill=skill,
+            agent=agent,
+            additional_dirs=self.additional_dirs,
+        )
+        qa_agent_name = qa_resolution.agent_name
         try:
-            agent = self.loader.load_agent("qa-tester")
+            qa_agent = self.loader.load_agent(qa_agent_name)
         except FileNotFoundError:
-            agent = self._synthetic_agent(
-                "qa-tester",
+            qa_agent = self._synthetic_agent(
+                qa_agent_name,
                 "You are a QA tester. Verify behavior with executable evidence and report a verdict.",
             )
         self.hooks.fire(
             "SubagentStart",
-            payload={"agent_type": "qa-tester", "agent": "qa-tester", "purpose": "Required runtime QA pass"},
+            payload={
+                "agent_type": qa_agent_name,
+                "agent": qa_agent_name,
+                "purpose": "Required runtime QA pass",
+                "qa_resolution": qa_resolution.__dict__,
+            },
             session=session,
             dry_run=self.dry_run,
         )
         qa_node = session.start_node(
             "agent",
-            "qa-tester",
-            metadata={"purpose": "Required runtime QA pass"},
+            qa_agent_name,
+            metadata={"purpose": "Required runtime QA pass", "qa_resolution": qa_resolution.__dict__},
         )
         prompt = qa_prompt(
-            task_agent=agent,
+            task_agent=qa_agent,
             project_root=self.project_root,
             target_path=target_path,
             parent_result=parent_result,
@@ -982,14 +1004,14 @@ class CodexSkillRuntime:
         )
         result = self.codex.exec_prompt(
             session=session,
-            label="required-qa-tester",
+            label=f"required-qa-{qa_agent_name}",
             workdir=self.project_root,
             prompt=prompt,
             dry_run=self.dry_run,
         )
         self.hooks.fire(
             "SubagentStop",
-            payload={"agent_type": "qa-tester", "agent": "qa-tester", "returncode": result.returncode},
+            payload={"agent_type": qa_agent_name, "agent": qa_agent_name, "returncode": result.returncode},
             session=session,
             dry_run=self.dry_run,
         )
@@ -1124,6 +1146,7 @@ class CodexSkillRuntime:
         add_section("mcp-context", mcp_instructions_context(self.project_root, additional_dirs=self.additional_dirs), priority=20)
         add_section("capability-context", capability_context(self.project_root, additional_dirs=self.additional_dirs), priority=20)
         add_section("project-memory", project_memory_context(self.project_root), priority=25)
+        add_section("compact-state", compact_state_context(session), priority=25)
         add_section("session-memory", session_memory_context(session), priority=15, required=True)
         add_section("invoked-skills", session.invoked_skills_context(max_chars=20000), priority=15, required=True)
         skill_registry = self.loader.skill_registry_context(
@@ -1135,11 +1158,13 @@ class CodexSkillRuntime:
             self.project_root,
             query=_context_query(session),
             recent_tools=_recent_tool_names(session),
+            selector=self._memory_side_query_selector(session) if _side_query_enabled() else None,
         )
         add_section("durable-memory", durable_memory, priority=45)
         memory = runtime_memory_context(self.project_root, exclude_session=session.id)
         add_section("runtime-memory", memory, priority=60)
         budgeted = apply_context_budget(sections, context_window=context_window_tokens())
+        record_compact_state(session, budgeted)
         bundle_sections = [section.text for section in budgeted.sections]
         bundle_sections.append(budget_context_for_prompt(budgeted))
         bundle = "\n\n---\n\n".join(bundle_sections)
@@ -1196,7 +1221,8 @@ class CodexSkillRuntime:
                 notes=notes,
                 gates=gates,
             )
-            extract_session_memories(
+            background = _memory_jobs_background()
+            extraction_job = run_memory_extraction_job(
                 self.project_root,
                 session,
                 command=command,
@@ -1204,10 +1230,54 @@ class CodexSkillRuntime:
                 status=status,
                 notes=notes,
                 gates=gates,
+                background=background,
             )
-            consolidate_memories(self.project_root)
+            consolidation_job = run_memory_consolidation_job(self.project_root, background=background)
+            session.event(
+                "memory.jobs",
+                "Scheduled runtime memory extraction and consolidation jobs",
+                extraction_job=str(extraction_job),
+                consolidation_job=str(consolidation_job),
+                background=background,
+            )
         except Exception as exc:
             session.event("memory.error", "Failed to record runtime memory", error=str(exc))
+
+    def _memory_side_query_selector(self, session: RuntimeSession):
+        def selector(query: str, headers: list[MemoryHeader], manifest: str, recent_tools: list[str]) -> list[str] | None:
+            self._side_query_counter += 1
+            valid = {item.filename for item in headers}
+            prompt = (
+                "# Runtime Memory Side Query\n\n"
+                "Select memory files useful for the current task. Return only JSON with key `selected_memories` as an array of filenames. "
+                "Only choose filenames from the manifest. Choose at most five. Return an empty array if none are clearly useful.\n\n"
+                f"## Query\n\n{query[:8000]}\n\n"
+                f"## Recently Used Tools\n\n{', '.join(recent_tools[:20])}\n\n"
+                f"## Memory Manifest\n\n{manifest[:20000]}\n"
+            )
+            result = self.codex.exec_prompt(
+                session=session,
+                label=f"memory-side-query-{self._side_query_counter:03d}",
+                workdir=self.project_root,
+                prompt=prompt,
+                dry_run=self.dry_run,
+                timeout_seconds=45,
+            )
+            if self.dry_run or result.returncode != 0:
+                return None
+            try:
+                parsed = parse_json_response(result.last_message)
+            except ValueError:
+                session.event("memory.side_query_error", "Memory side-query returned invalid JSON")
+                return None
+            selected = parsed.get("selected_memories")
+            if not isinstance(selected, list):
+                return None
+            filtered = [str(item) for item in selected if str(item) in valid]
+            session.event("memory.side_query", "Selected relevant memories via side-query", selected=filtered)
+            return filtered
+
+        return selector
 
 
 def _runtime_schema_path() -> Path:
@@ -1256,6 +1326,16 @@ def _recent_tool_names(session: RuntimeSession) -> list[str]:
 def _qa_auto_patterns() -> list[str]:
     raw = os.environ.get("SKILL_RUNTIME_QA_AUTO_PATTERNS") or os.environ.get("CODEX_SKILL_RUNTIME_QA_AUTO_PATTERNS") or ""
     return [item.strip() for item in raw.replace("\n", ";").split(";") if item.strip()]
+
+
+def _side_query_enabled() -> bool:
+    value = os.environ.get("SKILL_RUNTIME_MEMORY_SIDE_QUERY") or os.environ.get("CODEX_SKILL_RUNTIME_MEMORY_SIDE_QUERY") or "auto"
+    return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _memory_jobs_background() -> bool:
+    value = os.environ.get("SKILL_RUNTIME_MEMORY_JOBS") or os.environ.get("CODEX_SKILL_RUNTIME_MEMORY_JOBS") or "inline"
+    return value.strip().lower() in {"background", "async", "thread", "true", "1"}
 
 
 def _node_status_for_gate(gate: GateResult) -> str:

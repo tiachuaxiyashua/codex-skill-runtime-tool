@@ -13,16 +13,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from pathlib import Path
 
+from .api_transcript import api_transcript_context, load_api_messages
 from .bridge import LocalBridge, bridge_context
 from .capabilities import discover_capabilities
 from .codex_cli import CodexCLI
+from .compact_state import compact_state_context, record_compact_state
 from .frontmatter import MarkdownDocument
 from .gates import evaluate_qa_report
 from .hooks import HookDispatcher, hook_block_reason, hook_updated_input
 from .ide import IDESelection, ide_context, write_ide_diagnostics, write_ide_selection
 from .large_results import write_replacement_manifest
 from .loaders import SkillRepositoryLoader
-from .memdir import consolidate_memories, extract_session_memories, relevant_memory_context, scan_memory_files
+from .memdir import (
+    consolidate_memories,
+    extract_session_memories,
+    memory_root,
+    relevant_memory_context,
+    run_memory_consolidation_job,
+    run_memory_extraction_job,
+    scan_memory_files,
+)
 from .memory import project_memory_context, record_session_summary, runtime_memory_context
 from .mcp import discover_mcp_servers, mcp_instructions_context
 from .mcp_oauth import complete_oauth_authorization, start_oauth_authorization, stored_oauth_headers, token_record_from_auth_output
@@ -31,6 +41,7 @@ from .jobs import JobRegistry
 from .plugins import set_plugin_enabled
 from .prompts import skill_prompt
 from .questions import answer_pending_question, load_pending_question, pending_question_context
+from .qa import resolve_qa_agent
 from .runtime import CodexSkillRuntime
 from .secure_store import SecureTokenStore
 from .session import RuntimeSession
@@ -42,7 +53,7 @@ from .token_budget import ContextSection, apply_context_budget
 from .tool_executor import ToolExecutor
 from .transcript import replay_context
 from .voice import VoiceRuntime, session_text, voice_context
-from .workers import WorkerRegistry
+from .workers import WorkerRegistry, worker_scratchpad_context
 
 
 @dataclass
@@ -95,17 +106,23 @@ class SelfTester:
             self._project_memory_contract,
             self._hook_decision_contract,
             self._external_layout_contract,
+            self._qa_agent_resolution_contract,
             self._mcp_bridge_contract,
             self._compat_gap_contract,
             self._worker_registry_contract,
+            self._worker_scratchpad_contract,
             self._large_tool_result_contract,
+            self._api_message_transcript_contract,
             self._model_effort_command_contract,
             self._codex_api_proxy_config_contract,
             self._isolated_runtime_env_contract,
             self._memory_compaction_contract,
             self._session_memory_contract,
             self._memdir_recall_contract,
+            self._memory_side_query_contract,
+            self._memory_jobs_contract,
             self._token_budget_contract,
+            self._compact_state_contract,
             self._microcompact_contract,
             self._system_prompt_contract,
             self._transcript_resume_contract,
@@ -767,6 +784,42 @@ class SelfTester:
         self._assert(calls and calls[0][0] == "general-purpose", "forked skill did not use task runner")
         return "external command/plugin/fork contracts matched"
 
+    def _qa_agent_resolution_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-qa-resolution")
+        agent_dir = self.project_root / ".claude" / "agents"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        qa_agent_path = agent_dir / "custom-qa.md"
+        qa_agent_path.write_text(
+            "---\nname: custom-qa\ntools: [Read]\n---\nCustom QA agent body.\n",
+            encoding="utf-8",
+        )
+        skill = MarkdownDocument(
+            path=self.project_root / ".claude" / "skills" / "qa-probe" / "SKILL.md",
+            metadata={"name": "qa-probe", "qa_agent": "custom-qa"},
+            body="Probe skill body.",
+            raw="",
+        )
+        resolution = resolve_qa_agent(self.project_root, skill=skill, additional_dirs=self.additional_dirs)
+        self._assert(resolution.agent_name == "custom-qa", "frontmatter QA agent was not resolved")
+        runtime = CodexSkillRuntime(
+            project_root=self.project_root,
+            codex=CodexCLI(executable=self.codex_executable, model=self.model),
+            dry_run=True,
+            assume_yes=True,
+            qa_mode="off",
+        )
+        result = runtime._run_required_qa(
+            session=session,
+            target_path=str(self.project_root),
+            parent_result="QA resolver parent result",
+            skill=skill,
+        )
+        self._assert(result.returncode == 0, "required QA dry-run failed")
+        self._assert((session.dir / "required-qa-custom-qa" / "prompt.md").exists(), "required QA did not use resolved agent label")
+        tree = json.loads((session.dir / "task-tree.json").read_text(encoding="utf-8"))
+        self._assert("custom-qa" in json.dumps(tree), "resolved QA agent missing from session task tree")
+        return f"session={session.id} agent={resolution.agent_name} source={resolution.source}"
+
     def _mcp_bridge_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-mcp")
         mcp_root = session.path("mcp-root")
@@ -1108,6 +1161,52 @@ class SelfTester:
         self._assert("Runtime Durable Memory" in overview.read_text(encoding="utf-8"), "memory overview content missing")
         return f"session={session.id}"
 
+    def _memory_side_query_contract(self) -> str:
+        root = memory_root(self.project_root)
+        topics = root / "topics"
+        topics.mkdir(parents=True, exist_ok=True)
+        selected = topics / "side-selected.md"
+        rejected = topics / "side-rejected.md"
+        selected.write_text(
+            "---\ndescription: selected by side query\ntype: session\ntags: [side, selected]\n---\nSIDE_QUERY_SELECTED_MARKER\n",
+            encoding="utf-8",
+        )
+        rejected.write_text(
+            "---\ndescription: should not be selected\ntype: session\ntags: [side, rejected]\n---\nSIDE_QUERY_REJECTED_MARKER\n",
+            encoding="utf-8",
+        )
+
+        calls: list[str] = []
+
+        def selector(query, headers, manifest, recent_tools):
+            calls.append(manifest)
+            return ["topics/side-selected.md", "missing.md"]
+
+        context = relevant_memory_context(self.project_root, query="side query probe", selector=selector)
+        self._assert(calls, "side-query selector was not called")
+        self._assert("SIDE_QUERY_SELECTED_MARKER" in context, "side-query selected memory missing")
+        self._assert("SIDE_QUERY_REJECTED_MARKER" not in context, "side-query ignored selected filename list")
+        return "side-query selected bounded memory by filename"
+
+    def _memory_jobs_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-memory-jobs")
+        extraction = run_memory_extraction_job(
+            self.project_root,
+            session,
+            command="selftest-memory-jobs",
+            arguments="jobs",
+            status="PASS",
+            notes="MEMORY_JOB_MARKER",
+            gates=[],
+        )
+        consolidation = run_memory_consolidation_job(self.project_root, force=True)
+        extraction_data = json.loads(extraction.read_text(encoding="utf-8"))
+        consolidation_data = json.loads(consolidation.read_text(encoding="utf-8"))
+        self._assert(extraction_data.get("status") == "completed", "memory extraction job did not complete")
+        self._assert(consolidation_data.get("status") == "completed", "memory consolidation job did not complete")
+        self._assert(extraction_data.get("outputs"), "memory extraction job did not record outputs")
+        return f"session={session.id}"
+
     def _token_budget_contract(self) -> str:
         sections = [
             ContextSection("required", "REQUIRED_CONTEXT_MARKER", required=True, priority=1),
@@ -1120,6 +1219,28 @@ class SelfTester:
         self._assert("Runtime Context Budget" in result.report, "budget report header missing")
         self._assert(result.target_tokens == 5000, "budget target mismatch")
         return f"before={result.estimated_tokens_before} after={result.estimated_tokens_after}"
+
+    def _compact_state_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-compact-state")
+        update_session_memory(
+            session,
+            command="selftest-compact-state",
+            arguments="compact",
+            note="COMPACT_STATE_SESSION_MEMORY",
+            status="PASS",
+        )
+        sections = [
+            ContextSection("required", "required compact probe", required=True),
+            ContextSection("large", "x" * 70000, priority=50),
+        ]
+        budget = apply_context_budget(sections, context_window=14000, reserve_tokens=1000, min_preserved_tokens=1000)
+        state = record_compact_state(session, budget)
+        self._assert((session.dir / "compact-state.json").exists(), "compact-state.json missing")
+        self._assert(state.above_autocompact_threshold, "autocompact threshold was not detected")
+        self._assert(state.compact_summary_path and Path(state.compact_summary_path).exists(), "session-memory compact summary missing")
+        context = compact_state_context(session)
+        self._assert("Runtime Compact State" in context, "compact state context missing")
+        return f"session={session.id}"
 
     def _microcompact_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-microcompact")
@@ -1538,6 +1659,25 @@ class SelfTester:
         self._assert(described and described[0].get("status") == "stopped", "persisted worker status was not restored")
         return f"session={session.id}"
 
+    def _worker_scratchpad_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-worker-scratchpad")
+
+        def runner(agent: str, purpose: str, prompt: str, index: int) -> str:
+            self._assert("Runtime worker scratchpad" in prompt, "worker prompt did not include scratchpad instruction")
+            return "SCRATCHPAD_OUTPUT"
+
+        registry = WorkerRegistry(runner, session_dir=session.dir)
+        record = registry.spawn(agent="scratch-agent", purpose="scratch purpose", prompt="scratch prompt", name="scratch")
+        self._assert(record.scratchpad_dir, "worker scratchpad path missing")
+        scratchpad = Path(record.scratchpad_dir)
+        self._assert(scratchpad.exists(), "worker scratchpad directory missing")
+        (scratchpad / "note.txt").write_text("SCRATCHPAD_NOTE_MARKER", encoding="utf-8")
+        context = worker_scratchpad_context(session.dir)
+        self._assert("SCRATCHPAD_NOTE_MARKER" in context, "worker scratchpad context missing file preview")
+        persisted = json.loads((session.dir / "workers.json").read_text(encoding="utf-8"))
+        self._assert(persisted["workers"][0].get("scratchpad_dir"), "scratchpad path not persisted")
+        return f"session={session.id}"
+
     def _large_tool_result_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-large-result")
         rel = Path(".selftest") / session.id / "large.txt"
@@ -1555,6 +1695,25 @@ class SelfTester:
         self._assert("_large_result_replacements" in result.data, "large tool result was not replaced with preview")
         replacement = result.data["_large_result_replacements"][0]
         self._assert(Path(replacement["path"]).exists(), "large tool result full output was not persisted")
+        return f"session={session.id}"
+
+    def _api_message_transcript_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-api-transcript")
+        result = CodexCLI(executable=self.codex_executable).exec_prompt(
+            session=session,
+            label="api-transcript",
+            workdir=self.project_root,
+            prompt="API_TRANSCRIPT_USER_MARKER",
+            dry_run=True,
+        )
+        self._assert(result.returncode == 0, "api transcript dry-run failed")
+        messages = load_api_messages(session)
+        self._assert(len(messages) >= 2, "api transcript did not record user and assistant messages")
+        self._assert(any("API_TRANSCRIPT_USER_MARKER" in str(item.get("content")) for item in messages), "api transcript user content missing")
+        context = api_transcript_context(session)
+        self._assert("API Message Transcript" in context, "api transcript context missing")
+        replay = replay_context(self.project_root, session.id)
+        self._assert("API_TRANSCRIPT_USER_MARKER" in replay, "replay did not include API message transcript")
         return f"session={session.id}"
 
     def _model_effort_command_contract(self) -> str:

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .api_transcript import append_api_message
 from .session import RuntimeSession
 
 
@@ -117,6 +118,14 @@ class CodexCLI:
             prompt_path=str(prompt_path),
             workdir=str(workdir),
         )
+        append_api_message(
+            session,
+            role="user",
+            label=label,
+            content=prompt,
+            source_path=prompt_path,
+            metadata={"workdir": str(workdir), "output_schema": str(output_schema) if output_schema else ""},
+        )
 
         if dry_run:
             session.write_json(
@@ -136,6 +145,14 @@ class CodexCLI:
                 label=label,
                 last_message_path=str(last_message_path),
                 dry_run=True,
+            )
+            append_api_message(
+                session,
+                role="assistant",
+                label=label,
+                content="",
+                source_path=last_message_path,
+                metadata={"dry_run": True},
             )
             return CodexRunResult(
                 label=label,
@@ -185,6 +202,14 @@ class CodexCLI:
             preview=last_message_path.read_text(encoding="utf-8", errors="replace")[:4000]
             if last_message_path.exists()
             else "",
+        )
+        append_api_message(
+            session,
+            role="assistant",
+            label=label,
+            content=last_message_path.read_text(encoding="utf-8", errors="replace") if last_message_path.exists() else "",
+            source_path=last_message_path,
+            metadata={"returncode": completed.returncode},
         )
         return CodexRunResult(
             label=label,

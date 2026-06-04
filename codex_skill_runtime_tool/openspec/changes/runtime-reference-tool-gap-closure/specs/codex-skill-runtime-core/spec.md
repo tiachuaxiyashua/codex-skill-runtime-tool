@@ -70,3 +70,30 @@ or runtime state.
 - **WHEN** a due cron record reaches its fire time during the active runtime process
 - **THEN** the prompt is appended to the session cron fire queue
 - **AND** monitor state can retrieve the fired prompt.
+
+### Requirement: Runtime Tool Search Matches Executable Runtime Tools
+
+Runtime SHALL expose every generally executable runtime-owned tool through
+ToolSearch so a model can discover the same tools it can invoke through strict
+actions.
+
+#### Scenario: Model searches for a supported runtime tool
+
+- **WHEN** the model searches for question, todo, memory, web, bridge, voice,
+  IDE, or worker tools
+- **THEN** ToolSearch returns matching runtime-tool records
+- **AND** ToolSearch does not include full skill bodies in search results.
+
+### Requirement: Runtime Executes Bash Hook Shims Reliably On Windows
+
+Runtime SHALL normalize bash `.sh` hooks to LF shims and deliver hook payloads
+through a stable stdin mechanism.
+
+#### Scenario: Bash hook reads JSON from stdin
+
+- **WHEN** a hook script reads its payload from stdin
+- **THEN** the runtime provides the payload through a session payload file
+- **AND** Windows bash shim execution receives a small transport grace period
+  for shell startup overhead
+- **AND** hook timeouts are returned as hook results instead of uncaught runtime
+  exceptions.

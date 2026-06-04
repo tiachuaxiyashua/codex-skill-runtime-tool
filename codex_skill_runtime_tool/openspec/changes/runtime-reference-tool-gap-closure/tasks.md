@@ -9,4 +9,7 @@
 - [x] Update schema, aliases, prompt, hooks, and permission mapping.
 - [x] Add selftests for task-list, background agent, and reference gap tools.
 - [x] Run compile, selftest, OpenSpec validation, hardcoding scan, and targeted live smoke if feasible.
+- [x] Stabilize Windows bash hook shim payload delivery and timeout handling.
+- [x] Align ToolSearch short records with executable runtime-owned tools.
+- [x] Extract runtime/reference maps and record remaining execution-effect gaps.
 - [x] Commit and push.

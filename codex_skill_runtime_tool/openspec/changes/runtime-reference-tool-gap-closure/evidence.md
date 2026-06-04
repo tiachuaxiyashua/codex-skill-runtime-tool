@@ -12,10 +12,13 @@
   - PASS, no whitespace errors.
 - `python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env selftest`
   - PASS: `SELFTEST_SUMMARY total=49 failed=0`
-  - Passing contracts include task-list `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, background `Agent` plus `TaskOutput`, MCP auth pseudo-tool, dynamic MCP names, and Cron fire queue.
+  - Latest session: `20260604-104415-prototype` through `20260604-104554-selftest-hook`.
+  - Passing contracts include task-list `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, background `Agent` plus `TaskOutput`, MCP auth pseudo-tool, dynamic MCP names, Cron fire queue, full runtime ToolSearch coverage, and Windows bash hook shim execution.
 - `python -B codex_skill_runtime_tool\codex-skill-runtime-core\core_cli.py --runtime-env codex_skill_runtime_tool\config\skill-runtime.env strict-smoke README.md`
   - PASS: live Codex strict action loop reached `STRICT-SMOKE PASS`.
-  - Session: `20260603-031643-strict-smoke`
+  - Session: `20260604-104957-strict-smoke`
+- `codegraph` runtime map
+  - PASS: generated Python runtime code graph CSV with 502 module/class/function rows for dependency review.
 
 ## Known Limits
 

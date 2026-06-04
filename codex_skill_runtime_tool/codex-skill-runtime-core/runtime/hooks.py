@@ -293,32 +293,42 @@ class HookDispatcher:
                 normalized = source.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
                 shim = session.path("hook-shims", f"{event}-{source.name}")
                 shim.write_text(normalized, encoding="utf-8", newline="\n")
-                return subprocess.run(
-                    ["bash", _bash_path(shim), *parts[2:]],
-                    cwd=str(self.project_root),
-                    input=payload_text,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    capture_output=True,
-                    timeout=timeout,
-                    check=False,
-                    env=env,
-                )
+                payload_path = session.path("hook-payloads", f"{event}-{source.name}.json")
+                payload_path.write_text(payload_text + "\n", encoding="utf-8")
+                args = ["bash", _bash_path(shim), *parts[2:]]
+                try:
+                    with payload_path.open("r", encoding="utf-8") as payload_handle:
+                        return subprocess.run(
+                            args,
+                            cwd=str(self.project_root),
+                            stdin=payload_handle,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            capture_output=True,
+                            timeout=_bash_shim_timeout(timeout),
+                            check=False,
+                            env=env,
+                        )
+                except subprocess.TimeoutExpired as exc:
+                    return _timeout_completed(args, exc)
 
-        return subprocess.run(
-            command,
-            cwd=str(self.project_root),
-            input=payload_text,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            env=env,
-        )
+        try:
+            return subprocess.run(
+                command,
+                cwd=str(self.project_root),
+                input=payload_text,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_completed(command, exc)
 
 
 def _bash_path(path: Path) -> str:
@@ -328,6 +338,32 @@ def _bash_path(path: Path) -> str:
         rest = text[3:].replace("\\", "/")
         return f"/mnt/{drive}/{rest}"
     return text.replace("\\", "/")
+
+
+def _bash_shim_timeout(timeout: int) -> int:
+    if os.name != "nt":
+        return timeout
+    try:
+        grace = int(os.environ.get("SKILL_RUNTIME_BASH_HOOK_TIMEOUT_GRACE_SECONDS", "10"))
+    except ValueError:
+        grace = 10
+    return max(timeout, timeout + max(0, grace))
+
+
+def _timeout_completed(args: Any, exc: subprocess.TimeoutExpired) -> subprocess.CompletedProcess[str]:
+    stdout = _timeout_text(exc.stdout)
+    stderr = _timeout_text(exc.stderr)
+    timeout_message = f"Hook command timed out after {exc.timeout} seconds."
+    stderr = f"{stderr}\n{timeout_message}".strip()
+    return subprocess.CompletedProcess(args=args, returncode=124, stdout=stdout, stderr=stderr)
+
+
+def _timeout_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def hook_block_reason(results: Iterable[HookResult], *, assume_yes: bool = False) -> str | None:

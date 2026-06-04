@@ -1757,6 +1757,17 @@ class SelfTester:
         names = {row.get("name") for row in rows if isinstance(row, dict)}
         self._assert("task_output" in names or "task_create" in names, "ToolSearch did not return task tools")
         self._assert(all("Skill Body" not in json.dumps(row, ensure_ascii=False) for row in rows), "ToolSearch leaked full skill bodies")
+        for query, expected in [
+            ("ask user pause", "ask_user_question"),
+            ("todo list", "todo_write"),
+            ("project memory", "project_memory_read"),
+            ("web fetch", "web_fetch"),
+            ("voice transcript", "voice"),
+            ("ide diagnostics", "ide"),
+        ]:
+            search = executor.execute({"tool": "ToolSearch", "parameters": {"query": query, "limit": 8}})
+            search_names = {row.get("name") for row in search.data.get("results", []) if isinstance(row, dict)}
+            self._assert(expected in search_names, f"ToolSearch did not expose {expected}")
         skill_result = executor.execute({"tool": "tool_search", "parameters": {"query": "prototype", "limit": 20}})
         self._assert(skill_result.status == "OK", "snake_case tool_search failed")
         self._assert(any(row.get("kind") == "skill" for row in skill_result.data.get("results", []) if isinstance(row, dict)), "ToolSearch did not include visible skills")

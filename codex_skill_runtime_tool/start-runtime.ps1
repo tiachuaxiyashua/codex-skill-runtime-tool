@@ -199,6 +199,48 @@ function Test-UiHealth {
     }
 }
 
+function Test-UiCompatibility {
+    param(
+        [string]$BaseUrl,
+        [int]$TimeoutSec = 2
+    )
+
+    try {
+        $projects = Invoke-WebRequest -UseBasicParsing -Uri (Join-EndpointPath $BaseUrl "/api/projects") -TimeoutSec $TimeoutSec
+        return ($projects.StatusCode -ge 200 -and $projects.StatusCode -lt 500)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Stop-UiListener {
+    param([int]$PortValue)
+
+    $listeners = @(Get-NetTCPConnection -LocalPort $PortValue -State Listen -ErrorAction SilentlyContinue)
+    foreach ($listener in $listeners) {
+        $owningProcessId = [int]$listener.OwningProcess
+        if ($owningProcessId -le 0 -or $owningProcessId -eq $PID) {
+            continue
+        }
+        try {
+            $process = Get-Process -Id $owningProcessId -ErrorAction Stop
+            Write-Host "[RUN ] Stopping incompatible Runtime UI process: pid=$owningProcessId ($($process.ProcessName))"
+            Stop-Process -Id $owningProcessId -Force
+        }
+        catch {
+            Write-Host "[WARN] Could not stop process using port ${PortValue}: pid=$owningProcessId"
+        }
+    }
+    for ($i = 0; $i -lt 20; $i++) {
+        $stillListening = @(Get-NetTCPConnection -LocalPort $PortValue -State Listen -ErrorAction SilentlyContinue)
+        if ($stillListening.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
 function Start-RuntimeUi {
     param(
         [string]$RuntimeEnvPath,
@@ -208,8 +250,13 @@ function Start-RuntimeUi {
 
     $baseUrl = "http://${HostValue}:${PortValue}"
     if (Test-UiHealth -BaseUrl $baseUrl) {
-        Write-Host "[ OK ] Runtime UI is already running: $baseUrl"
-        return $baseUrl
+        if (Test-UiCompatibility -BaseUrl $baseUrl) {
+            Write-Host "[ OK ] Runtime UI is already running: $baseUrl"
+            return $baseUrl
+        }
+        Write-Host "[WARN] A Runtime UI is listening on $baseUrl, but it is missing required APIs. Restarting it."
+        Stop-UiListener -PortValue $PortValue
+        Start-Sleep -Seconds 1
     }
 
     $python = Get-Command python -ErrorAction SilentlyContinue
@@ -230,7 +277,7 @@ function Start-RuntimeUi {
 
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 500
-        if (Test-UiHealth -BaseUrl $baseUrl) {
+        if ((Test-UiHealth -BaseUrl $baseUrl) -and (Test-UiCompatibility -BaseUrl $baseUrl)) {
             Write-Host "[ OK ] Runtime UI started: $baseUrl"
             return $baseUrl
         }

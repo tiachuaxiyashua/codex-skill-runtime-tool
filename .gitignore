@@ -12,6 +12,7 @@ codex_skill_runtime_tool/.skill-runtime/
 *.pyc
 *.pyo
 *.log
+references/
 
 # Generated test games and temporary package outputs
 game_projects/
@@ -22,4 +23,3 @@ codex_skill_packages/
 .idea/
 .DS_Store
 Thumbs.db
-

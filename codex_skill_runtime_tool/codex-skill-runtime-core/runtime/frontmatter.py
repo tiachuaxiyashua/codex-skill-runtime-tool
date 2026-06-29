@@ -46,51 +46,105 @@ def _parse_yaml(text: str) -> dict[str, Any]:
 
 
 def _parse_simple_yaml(text: str) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    current_list_key: str | None = None
-    current_block_key: str | None = None
-    block_lines: list[str] = []
+    lines = _yaml_lines(text)
+    if not lines:
+        return {}
+    parsed, _ = _parse_yaml_block(lines, 0, lines[0][0])
+    return parsed if isinstance(parsed, dict) else {}
 
-    def flush_block() -> None:
-        nonlocal current_block_key, block_lines
-        if current_block_key is not None:
-            result[current_block_key] = "\n".join(block_lines).rstrip()
-            current_block_key = None
-            block_lines = []
 
+def _yaml_lines(text: str) -> list[tuple[int, str]]:
+    result: list[tuple[int, str]] = []
     for raw_line in text.splitlines():
-        stripped = raw_line.strip()
-        if current_block_key is not None:
-            if raw_line.startswith((" ", "\t")) or not stripped:
-                block_lines.append(raw_line.lstrip())
-                continue
-            flush_block()
-
-        line = stripped
-        if not line or line.startswith("#") or ":" not in line:
-            if current_list_key and line.startswith("- "):
-                if not isinstance(result.get(current_list_key), list):
-                    result[current_list_key] = []
-                result[current_list_key].append(_parse_value(line[2:].strip()))
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
-        if current_list_key and line.startswith("- "):
-            if not isinstance(result.get(current_list_key), list):
-                result[current_list_key] = []
-            result[current_list_key].append(_parse_value(line[2:].strip()))
-            continue
-
-        key, value = line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if value in {"|", ">"}:
-            current_list_key = None
-            current_block_key = key
-            block_lines = []
-            continue
-        result[key] = [] if value == "" else _parse_value(value)
-        current_list_key = key if value == "" else None
-    flush_block()
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        result.append((indent, raw_line.strip()))
     return result
+
+
+def _parse_yaml_block(lines: list[tuple[int, str]], index: int, indent: int) -> tuple[Any, int]:
+    if index >= len(lines):
+        return {}, index
+    if lines[index][1].startswith("- "):
+        return _parse_yaml_list(lines, index, indent)
+    return _parse_yaml_dict(lines, index, indent)
+
+
+def _parse_yaml_dict(lines: list[tuple[int, str]], index: int, indent: int) -> tuple[dict[str, Any], int]:
+    result: dict[str, Any] = {}
+    while index < len(lines):
+        line_indent, content = lines[index]
+        if line_indent < indent:
+            break
+        if line_indent > indent:
+            index += 1
+            continue
+        if content.startswith("- ") or ":" not in content:
+            break
+
+        key, raw_value = content.split(":", 1)
+        key = key.strip()
+        value = raw_value.strip()
+        if value in {"|", ">"}:
+            block, index = _parse_literal_block(lines, index + 1, indent)
+            result[key] = block
+            continue
+        if value:
+            result[key] = _parse_value(value)
+            index += 1
+            continue
+        if index + 1 < len(lines) and lines[index + 1][0] > line_indent:
+            child, index = _parse_yaml_block(lines, index + 1, lines[index + 1][0])
+            result[key] = child
+        else:
+            result[key] = {}
+            index += 1
+    return result, index
+
+
+def _parse_yaml_list(lines: list[tuple[int, str]], index: int, indent: int) -> tuple[list[Any], int]:
+    result: list[Any] = []
+    while index < len(lines):
+        line_indent, content = lines[index]
+        if line_indent < indent:
+            break
+        if line_indent > indent:
+            index += 1
+            continue
+        if not content.startswith("- "):
+            break
+
+        item = content[2:].strip()
+        next_index = index + 1
+        child: Any = None
+        if next_index < len(lines) and lines[next_index][0] > line_indent:
+            child, next_index = _parse_yaml_block(lines, next_index, lines[next_index][0])
+
+        if not item:
+            result.append(child if child is not None else "")
+        elif ":" in item and not item.startswith(("http://", "https://")):
+            key, raw_value = item.split(":", 1)
+            value = raw_value.strip()
+            record: dict[str, Any] = {key.strip(): _parse_value(value) if value else {}}
+            if isinstance(child, dict):
+                record.update(child)
+            result.append(record)
+        else:
+            result.append(_parse_value(item))
+        index = next_index
+    return result, index
+
+
+def _parse_literal_block(lines: list[tuple[int, str]], index: int, parent_indent: int) -> tuple[str, int]:
+    block_lines: list[str] = []
+    while index < len(lines):
+        line_indent, content = lines[index]
+        if line_indent <= parent_indent:
+            break
+        block_lines.append(content)
+        index += 1
+    return "\n".join(block_lines).rstrip(), index
 
 
 def _parse_value(value: str) -> Any:

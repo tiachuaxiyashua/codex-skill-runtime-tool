@@ -28,6 +28,7 @@ class RuntimeConfig:
     codex_profile: str | None = None
     codex_env: dict[str, str] | None = None
     codex_config: tuple[str, ...] = ()
+    codex_global_args: tuple[str, ...] = ()
     isolated_codex_home: Path | None = None
     codex_config_path: Path | None = None
     codex_auth_path: Path | None = None
@@ -80,6 +81,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None, help="Codex model override.")
     parser.add_argument("--codex-profile", default=None, help="Codex config.toml profile to pass through to codex CLI.")
     parser.add_argument("--codex-config", action="append", default=[], help="Raw codex --config key=value override. Repeatable.")
+    parser.add_argument("--codex-global-arg", action="append", default=[], help="Raw global codex CLI arg forwarded before exec. Repeatable.")
+    parser.add_argument("--codex-oss", action="store_true", help="Forward codex --oss to use the open-source provider.")
+    parser.add_argument("--codex-local-provider", default=None, help="Forward codex --local-provider <name> when --codex-oss is enabled.")
     parser.add_argument("--codex-env", action="append", default=[], help="Environment variable for codex child process, KEY=VALUE. Repeatable.")
     parser.add_argument("--codex-env-file", action="append", default=[], help="Load codex child-process environment variables from a .env file.")
     parser.add_argument("--codex-api-key", default=None, help="API key value or @file. Injected as OPENAI_API_KEY for codex child process.")
@@ -119,6 +123,9 @@ def _build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Run a slash command from the loaded skill repository.")
     run.add_argument("invocation", nargs=argparse.REMAINDER, help="Slash command and arguments, e.g. /namespace:skill task details.")
 
+    chat = sub.add_parser("chat", help="Run a real Codex chat turn without pretending runtime routing is an assistant reply.")
+    chat.add_argument("message", nargs=argparse.REMAINDER)
+
     agent = sub.add_parser("agent", help="Run one loaded agent directly.")
     agent.add_argument("agent_name")
     agent.add_argument("prompt", nargs=argparse.REMAINDER)
@@ -142,6 +149,7 @@ def _build_parser() -> argparse.ArgumentParser:
     selftest = sub.add_parser("selftest", help="Run runtime self-tests against the loaded repository.")
     selftest.add_argument("--live-qa-target", default=None, help="Optional project path for a real Codex qa-tester self-test.")
     selftest.add_argument("--live-strict-target", default=None, help="Optional file path for a real strict action-loop self-test.")
+    selftest.add_argument("--only", action="append", default=[], help="Run only matching self-test names. Repeatable; accepts hyphenated check names.")
     return parser
 
 
@@ -191,6 +199,7 @@ def _config_from_args(args: argparse.Namespace, *, argv: list[str] | None = None
     )
     codex_env = _codex_env_from_args(args, runtime_env=runtime_env, explicit=explicit, root=target_workspace, runtime_env_file=runtime_env_file)
     codex_config = _codex_config_from_args(args, runtime_env=runtime_env, explicit=explicit)
+    codex_global_args = _codex_global_args_from_args(args, runtime_env=runtime_env, explicit=explicit)
     runtime_state_root = _effective_optional_text(
         args,
         "runtime_state_root",
@@ -212,6 +221,7 @@ def _config_from_args(args: argparse.Namespace, *, argv: list[str] | None = None
         codex_profile=codex_profile,
         codex_env=codex_env,
         codex_config=tuple(codex_config),
+        codex_global_args=tuple(codex_global_args),
         dry_run=_effective_bool(args, "dry_run", runtime_env, ("SKILL_RUNTIME_DRY_RUN",), explicit, ("--dry-run",)),
         assume_yes=_effective_bool(args, "assume_yes", runtime_env, ("SKILL_RUNTIME_ASSUME_YES",), explicit, ("--assume-yes",)),
         qa=_effective_choice(args, "qa", runtime_env, ("SKILL_RUNTIME_QA",), explicit, ("--qa",), {"auto", "off", "required"}),
@@ -254,6 +264,7 @@ def _runtime_from_config(config: RuntimeConfig) -> CodexSkillRuntime:
             add_dirs=codex_add_dirs,
             env=config.codex_env or {},
             config_overrides=config.codex_config,
+            global_args=config.codex_global_args,
             profile=config.codex_profile,
         ),
         dry_run=config.dry_run,
@@ -340,6 +351,31 @@ def _apply_runtime_process_env(runtime_env: dict[str, str]) -> None:
             "SKILL_RUNTIME_QA_AUTO_PATTERNS",
             "CODEX_SKILL_RUNTIME_QA_AUTO_PATTERNS",
             "CODEX_SKILL_RUNTIME_BARE",
+            "SKILL_RUNTIME_CONTEXT_MODE",
+            "CODEX_SKILL_RUNTIME_CONTEXT_MODE",
+            "SKILL_RUNTIME_LEAN_SKILL_BODY_CHARS",
+            "CODEX_SKILL_RUNTIME_LEAN_SKILL_BODY_CHARS",
+            "SKILL_RUNTIME_LEAN_SECTION_MAX_CHARS",
+            "CODEX_SKILL_RUNTIME_LEAN_SECTION_MAX_CHARS",
+            "SKILL_RUNTIME_LEAN_AGENT_BODY_CHARS",
+            "CODEX_SKILL_RUNTIME_LEAN_AGENT_BODY_CHARS",
+            "SKILL_RUNTIME_CONTEXT_HISTORY",
+            "CODEX_SKILL_RUNTIME_CONTEXT_HISTORY",
+            "SKILL_RUNTIME_CONTEXT_REGISTRY",
+            "CODEX_SKILL_RUNTIME_CONTEXT_REGISTRY",
+            "SKILL_RUNTIME_CONTEXT_EXTERNAL",
+            "CODEX_SKILL_RUNTIME_CONTEXT_EXTERNAL",
+            "SKILL_RUNTIME_MEMORY_SIDE_QUERY",
+            "CODEX_SKILL_RUNTIME_MEMORY_SIDE_QUERY",
+            "SKILL_RUNTIME_MEMORY_JOBS",
+            "CODEX_SKILL_RUNTIME_MEMORY_JOBS",
+            "SKILL_RUNTIME_CODEX_TIMEOUT_SECONDS",
+            "SKILL_RUNTIME_CODEX_STALL_TIMEOUT_SECONDS",
+            "SKILL_RUNTIME_CODEX_RETRY_ATTEMPTS",
+            "SKILL_RUNTIME_CODEX_RETRY_BACKOFF_SECONDS",
+            "SKILL_RUNTIME_CODEX_SCHEMA_STALL_TIMEOUT_SECONDS",
+            "SKILL_RUNTIME_CODEX_SCHEMA_RETRY_ATTEMPTS",
+            "SKILL_RUNTIME_CODEX_SCHEMA_RETRY_BACKOFF_SECONDS",
         }:
             os.environ[key] = value
         elif key.startswith("SKILL_RUNTIME_CAPABILITY_") or key.startswith("CODEX_SKILL_RUNTIME_CAPABILITY_"):
@@ -355,6 +391,14 @@ def _codex_config_from_args(
     runtime_env = dict(runtime_env or {})
     explicit = set(explicit or set())
     values = _split_list(_first_env(runtime_env, ("SKILL_RUNTIME_CODEX_CONFIG", "CODEX_CONFIG")))
+    use_oss = _effective_bool(
+        args,
+        "codex_oss",
+        runtime_env,
+        ("SKILL_RUNTIME_CODEX_OSS", "CODEX_OSS"),
+        explicit,
+        ("--codex-oss",),
+    )
 
     base_url = _effective_optional_text(
         args,
@@ -364,7 +408,7 @@ def _codex_config_from_args(
         explicit,
         ("--codex-base-url",),
     )
-    if base_url:
+    if base_url and not use_oss:
         provider = _effective_optional_text(
             args,
             "codex_provider",
@@ -399,6 +443,31 @@ def _codex_config_from_args(
             ]
         )
     values.extend(str(item) for item in args.codex_config if str(item).strip())
+    return values
+
+
+def _codex_global_args_from_args(
+    args: argparse.Namespace,
+    *,
+    runtime_env: dict[str, str] | None = None,
+    explicit: set[str] | None = None,
+) -> list[str]:
+    runtime_env = dict(runtime_env or {})
+    explicit = set(explicit or set())
+    values = [str(item) for item in _split_list(_first_env(runtime_env, ("SKILL_RUNTIME_CODEX_GLOBAL_ARGS", "CODEX_GLOBAL_ARGS")))]
+    values.extend(str(item) for item in getattr(args, "codex_global_arg", []) if str(item).strip())
+    if _effective_bool(args, "codex_oss", runtime_env, ("SKILL_RUNTIME_CODEX_OSS", "CODEX_OSS"), explicit, ("--codex-oss",)):
+        values.insert(0, "--oss")
+        local_provider = _effective_optional_text(
+            args,
+            "codex_local_provider",
+            runtime_env,
+            ("SKILL_RUNTIME_CODEX_LOCAL_PROVIDER", "CODEX_LOCAL_PROVIDER"),
+            explicit,
+            ("--codex-local-provider",),
+        )
+        if local_provider:
+            values.extend(["--local-provider", local_provider])
     return values
 
 
@@ -770,6 +839,13 @@ def _dispatch_noninteractive(
         _print_result(result)
         return result.exit_code
 
+    if args.command_name == "chat":
+        if not args.message:
+            parser.error("chat requires a message")
+        result = runtime.run_chat_loop(" ".join(args.message), max_steps=config.max_steps)
+        _print_result(result)
+        return result.exit_code
+
     if args.command_name == "agent":
         result = runtime.run_agent(args.agent_name, " ".join(args.prompt))
         _print_result(result)
@@ -783,7 +859,7 @@ def _dispatch_noninteractive(
     if args.command_name == "answer":
         if not args.answer:
             parser.error("answer requires text, e.g. skill-runtime answer <session> \"choose option A\"")
-        result = runtime.answer_question(args.session, " ".join(args.answer))
+        result = runtime.answer_question(args.session, " ".join(args.answer), max_steps=config.max_steps)
         _print_result(result)
         return result.exit_code
 
@@ -806,7 +882,7 @@ def _dispatch_noninteractive(
             live_strict_target=args.live_strict_target,
             additional_dirs=_unique_paths([*skill_repos[1:], *config.add_dirs]),
         )
-        return tester.run_all()
+        return tester.run_all(only=args.only or None)
 
     parser.error(f"Unknown command: {args.command_name}")
     return 2

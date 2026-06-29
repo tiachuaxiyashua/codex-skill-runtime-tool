@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional
 
 from .session import RuntimeSession
 from .state_paths import runtime_state_path
@@ -44,7 +45,7 @@ class PermissionDecision:
 
 
 PromptHookRunner = Callable[
-    [str, dict[str, Any], RuntimeSession | None, Path | None, int],
+    [str, dict[str, Any], Optional[RuntimeSession], Optional[Path], int],
     subprocess.CompletedProcess[str],
 ]
 
@@ -286,13 +287,17 @@ class HookDispatcher:
             env["CLAUDE_ENV_FILE"] = str(session.path("hook-env.json"))
         if plugin_root is not None:
             env["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
-        parts = command.split()
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
         if len(parts) >= 2 and parts[0] == "bash" and parts[1].endswith(".sh") and session is not None:
-            source = ((hook_script_root or self.project_root) / parts[1]).resolve()
+            script_path = Path(parts[1]).expanduser()
+            source = script_path.resolve() if script_path.is_absolute() else ((hook_script_root or self.project_root) / script_path).resolve()
             if source.exists() and source.is_file():
                 normalized = source.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
                 shim = session.path("hook-shims", f"{event}-{source.name}")
-                shim.write_text(normalized, encoding="utf-8", newline="\n")
+                _write_text_lf(shim, normalized)
                 payload_path = session.path("hook-payloads", f"{event}-{source.name}.json")
                 payload_path.write_text(payload_text + "\n", encoding="utf-8")
                 args = ["bash", _bash_path(shim), *parts[2:]]
@@ -338,6 +343,11 @@ def _bash_path(path: Path) -> str:
         rest = text[3:].replace("\\", "/")
         return f"/mnt/{drive}/{rest}"
     return text.replace("\\", "/")
+
+
+def _write_text_lf(path: Path, text: str) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
 
 
 def _bash_shim_timeout(timeout: int) -> int:

@@ -10,6 +10,22 @@
 .\codex_skill_runtime_tool\start-runtime.ps1
 ```
 
+如果你要把它放进 macOS「快捷指令」或直接做成一个手动启动入口，请用：
+
+```bash
+./codex_skill_runtime_tool/start-runtime-shortcut-macos.sh
+```
+
+这个入口会启动 runtime UI，打开网页，并在你关闭页面后清理本次会话启动的 runtime 及其由 UI 启动的外部服务。
+
+如果是在「快捷指令」里的“运行 Shell 脚本”，不要直接填脚本路径，要填：
+
+```bash
+bash "/Users/sanchuan/Documents/chuanproject/claude_code_game_sutdio/codex_skill_runtime_tool/start-runtime-shortcut-macos.sh"
+```
+
+如果系统仍然提示 `Operation not permitted`，去「系统设置」里给“快捷指令”开启对“文稿/完整磁盘访问”的权限，或者先把脚本复制到一个快捷指令可读取的位置再执行。
+
 如果是双击启动，可以运行：
 
 ```text
@@ -22,7 +38,7 @@ codex_skill_runtime_tool\start-runtime.bat
 codex_skill_runtime_tool\config\skill-runtime.env
 ```
 
-并检查 Codex CLI、Codex API key、Godot 路径、Forge/A1111、ComfyUI，然后启动通用 Web UI。
+并检查 Codex CLI、Codex API key、Godot 路径，然后启动通用 Web UI。
 
 在工程根目录运行：
 
@@ -54,14 +70,13 @@ python -B codex_skill_runtime_tool\runtime-ui.py --runtime-env codex_skill_runti
 .\codex_skill_runtime_tool\start-runtime.ps1 -CheckOnly
 ```
 
-如果 Forge 或 ComfyUI 没有启动，脚本默认只会报告不可达。需要让脚本自动启动外部程序时，在 `skill-runtime.env` 中配置：
+外部服务不会由 runtime 自动拉起。它们会从 `skill-runtime.env` 的通用 service registry 读取，并在 UI 里手动启动/停止：
 
 ```env
-SKILL_RUNTIME_START_FORGE_CMD=<启动 Forge 的 PowerShell 命令>
-SKILL_RUNTIME_START_COMFYUI_CMD=<启动 ComfyUI 的 PowerShell 命令>
+SKILL_RUNTIME_SERVICES_JSON={"services":[...]}
 ```
 
-这个设计是为了保持 runtime 通用：runtime 只知道能力端点和可选启动命令，不绑定 Stability Matrix、Forge、ComfyUI 或某个游戏项目的安装方式。
+这个设计是为了保持 runtime 通用：runtime 只知道能力端点、服务状态和可选启动命令，不绑定 Stability Matrix、Forge、ComfyUI 或某个游戏项目的安装方式。
 
 ## UI 能看到什么
 

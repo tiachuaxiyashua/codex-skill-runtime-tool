@@ -788,6 +788,9 @@ def _resolve_server(
 
 def _stdio_env(*, project_root: Path, server: MCPServerConfig) -> dict[str, str]:
     env = dict(os.environ)
+    plugin_python_path = _plugin_python_path()
+    if plugin_python_path:
+        env["PATH"] = plugin_python_path + os.pathsep + env.get("PATH", "")
     if server.plugin_root is not None:
         env["CLAUDE_PLUGIN_ROOT"] = str(server.plugin_root)
     env["CLAUDE_PROJECT_DIR"] = str(project_root)
@@ -796,6 +799,20 @@ def _stdio_env(*, project_root: Path, server: MCPServerConfig) -> dict[str, str]
         for key, value in raw_env.items():
             env[str(key)] = _expand_env(str(value), project_root=project_root, plugin_root=server.plugin_root)
     return env
+
+
+def _plugin_python_path() -> str:
+    values = [
+        os.environ.get("SKILL_RUNTIME_PLUGIN_PYTHON_PATH", ""),
+        os.environ.get("CODEX_SKILL_RUNTIME_PLUGIN_PYTHON_PATH", ""),
+    ]
+    bins: list[str] = []
+    for value in values:
+        for item in re.split(r"[;:]", value):
+            text = item.strip()
+            if text:
+                bins.append(text)
+    return os.pathsep.join(bins)
 
 
 def _is_remote_server(config: dict[str, Any]) -> bool:

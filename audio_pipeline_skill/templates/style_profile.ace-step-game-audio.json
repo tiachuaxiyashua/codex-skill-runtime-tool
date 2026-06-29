@@ -25,7 +25,7 @@
   "model_files": {
     "unet_name": "acestep_v1.5_turbo.safetensors",
     "clip_name1": "qwen_0.6b_ace15.safetensors",
-    "clip_name2": "qwen_4b_ace15.safetensors",
+    "clip_name2": "qwen_0.6b_ace15.safetensors",
     "vae_name": "ace_1.5_vae.safetensors"
   },
   "final_asset_rules": {

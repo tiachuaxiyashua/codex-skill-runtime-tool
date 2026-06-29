@@ -3,9 +3,11 @@
 import json
 import fnmatch
 import os
+import re
 import subprocess
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .action_loop import StrictActionLoop
@@ -26,7 +28,7 @@ from .memory import agent_memory_context, project_memory_context, record_session
 from .plan_state import plan_mode_context
 from .prompts import agent_task_prompt, qa_prompt, skill_prompt
 from .qa import resolve_qa_agent
-from .questions import answer_pending_question, pending_question_context
+from .questions import answer_pending_question, pending_question_context, record_pending_question
 from .session import RuntimeSession
 from .session_memory import maybe_update_session_memory, session_memory_context
 from .state_machines import build_workflow_plan
@@ -39,7 +41,7 @@ from .system_prompt import (
 from .tasks import parse_task_requests
 from .token_budget import ContextSection, apply_context_budget, budget_context_for_prompt, context_window_tokens
 from .tool_executor import ToolExecutor
-from .transcript import replay_context
+from .transcript import find_session_dir, replay_context
 from .voice import voice_context
 from .workers import WorkerRegistry
 
@@ -51,6 +53,131 @@ class RuntimeResult:
     tasks: list[CodexRunResult]
     gates: list[GateResult]
     exit_code: int
+
+
+
+
+QUESTION_REQUEST_PATTERNS: tuple[str, ...] = (
+    "请回答",
+    "请回复",
+    "请选择",
+    "请选择一个",
+    "请确认",
+    "需要你",
+    "需要您",
+    "告诉我",
+    "请告诉我",
+    "先确认",
+    "先回答",
+    "先补充",
+    "请补充",
+    "请提供",
+    "请说明",
+    "请输入",
+    "等待你",
+    "等待您",
+)
+
+QUESTION_WORD_PATTERNS: tuple[str, ...] = (
+    "是否",
+    "能否",
+    "可否",
+    "还是",
+    "哪个",
+    "哪一个",
+    "哪些",
+    "什么",
+    "如何",
+)
+
+
+def _assistant_question_from_text(text: str) -> dict[str, object] | None:
+    value = str(text or "").strip()
+    if not value:
+        return None
+    explicit = _explicit_user_decision_block(value)
+    if explicit:
+        return explicit
+    return None
+
+
+def _explicit_user_decision_block(text: str) -> dict[str, object] | None:
+    value = str(text or "").strip()
+    match = re.search(r"(?is)USER_DECISION_REQUIRED\s*:?\s*(?P<body>.+)", value)
+    if not match:
+        return None
+    body = match.group("body").strip()
+    if not body:
+        return None
+    paragraphs = [part.strip() for part in re.split(r"\n{2,}", value) if part.strip()]
+    body_paragraphs = [part.strip() for part in re.split(r"\n{2,}", body) if part.strip()]
+    candidates = body_paragraphs or paragraphs or [body]
+    for block in reversed(candidates):
+        if _block_looks_like_question(block):
+            question, options = _normalize_question_block(block)
+            if question:
+                return {"question": question, "options": options}
+    sentences = [part.strip() for part in re.split(r"(?<=[？?。！!])\s*", body) if part.strip()]
+    for block in reversed(sentences):
+        if _block_looks_like_question(block):
+            question, options = _normalize_question_block(block)
+            if question:
+                return {"question": question, "options": options}
+    question, options = _normalize_question_block(body)
+    return {"question": question, "options": options} if question else None
+
+
+def _block_looks_like_question(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if re.search(r"[？?]\s*$", value):
+        return True
+    if re.search(r"[？?]", value):
+        return True
+    lowered = value.lower()
+    if any(hint in value for hint in QUESTION_REQUEST_PATTERNS):
+        return True
+    if any(hint in lowered for hint in ("please answer", "please choose", "please select", "please provide", "please confirm", "tell me", "choose one", "pick one", "select one")):
+        return True
+    addressed_to_user = bool(re.search(r"(你|您|your|you)\b?", value, flags=re.IGNORECASE))
+    return addressed_to_user and (any(hint in value for hint in QUESTION_WORD_PATTERNS) or any(hint in lowered for hint in ("which", "what", "how", "whether")))
+
+
+def _normalize_question_block(text: str) -> tuple[str, list[str]]:
+    value = str(text or "").strip()
+    if not value:
+        return "", []
+    lines = [line.rstrip() for line in value.splitlines()]
+    option_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^(?:[-*•]|\d+[.)]|[A-Z][.)])\s+", stripped):
+            option_lines.append(re.sub(r"^(?:[-*•]|\d+[.)]|[A-Z][.)])\s+", "", stripped).strip())
+    if not option_lines:
+        quoted = []
+        for match in re.finditer(r"[`'“‘]([^`'”’]{1,48})[`'”’]", value):
+            item = match.group(1).strip()
+            if item and item not in quoted:
+                quoted.append(item)
+        option_lines = quoted[:6]
+    question = value
+    if len(lines) > 1:
+        first = lines[0].strip()
+        if _block_looks_like_question(first):
+            question = first
+        else:
+            question = "\n".join(line for line in lines if line.strip())
+    if len(question) > 1600:
+        question = question[:1600].rstrip() + "..."
+    return question, option_lines[:6]
+
+
+def _session_answerable_question_text(text: str) -> str:
+    question = _assistant_question_from_text(text)
+    if not question:
+        return ""
+    return str(question.get("question") or "").strip()
 
 
 class CodexSkillRuntime:
@@ -86,6 +213,37 @@ class CodexSkillRuntime:
             prompt_runner=self._run_prompt_hook,
         )
 
+    def _record_waiting_question(
+        self,
+        session: RuntimeSession,
+        *,
+        node_id: str,
+        source_label: str,
+        message: str,
+        parent_message: str,
+        evidence: dict[str, object] | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> bool:
+        parsed = _assistant_question_from_text(message)
+        if not parsed:
+            return False
+        question = str(parsed.get("question") or "").strip()
+        if not question:
+            return False
+        options = parsed.get("options") if isinstance(parsed.get("options"), list) else []
+        session.finish_node(node_id, status="done", evidence=evidence, metadata=metadata)
+        question_node = session.start_node(
+            "question",
+            "assistant-question",
+            parent_id=node_id,
+            status="waiting_user",
+            metadata={"question": question, "options": options, "source": source_label},
+        )
+        pending = record_pending_question(session, question=question, options=options)
+        session.update_node(question_node, evidence={"pending_question": str(session.path("pending-question.json"))})
+        session.set_status("waiting_user")
+        return True
+
     def inspect(self) -> dict[str, object]:
         self.loader.assert_valid()
         return {
@@ -100,6 +258,276 @@ class CodexSkillRuntime:
             "settings": str(self.loader.primary_settings_path()),
             "context_files": [str(path) for path in self.loader.optional_context_files()],
         }
+
+    def chat_turn(self, message: str) -> RuntimeResult:
+        session = self._new_session("chat")
+        created_at = datetime.now().isoformat(timespec="seconds")
+        session.set_metadata(user_prompt=message, arguments=message, invocation="chat", chat=True, created_at=created_at)
+        session.event("session.start", "Starting chat turn", user_prompt=message)
+        session.set_status("running")
+        chat_node = session.start_node(
+            "chat",
+            "chat-turn",
+            display_name="Chat turn",
+            metadata={"user_prompt": message[:1000]},
+        )
+        context = self._context_bundle(session=session, hook_results=[])
+        registry = self.loader.skill_registry_context(max_chars=12000)
+        prompt = _chat_turn_prompt(message=message, context=context, skill_registry=registry)
+        run = self.codex.exec_prompt(
+            session=session,
+            label="chat-turn",
+            workdir=self.project_root,
+            prompt=prompt,
+            dry_run=self.dry_run,
+        )
+        status = "passed" if run.returncode == 0 else "failed"
+        waiting = False
+        final = run.last_message if run.returncode == 0 else f"Codex chat turn failed with exit {run.returncode}: {run.failure_reason}"
+        if run.returncode == 0:
+            waiting = self._record_waiting_question(
+                session,
+                node_id=chat_node,
+                source_label="chat",
+                message=final,
+                parent_message=message,
+                evidence={"last_message": str(run.last_message_path), "stdout": str(run.stdout_path), "stderr": str(run.stderr_path)},
+                metadata={"returncode": run.returncode},
+            )
+        if not waiting:
+            session.finish_node(
+                chat_node,
+                status=status,
+                evidence={"last_message": str(run.last_message_path), "stdout": str(run.stdout_path), "stderr": str(run.stderr_path)},
+                metadata={"returncode": run.returncode},
+            )
+            session.set_status("done" if run.returncode == 0 else "failed")
+            summary_status = "PASS" if run.returncode == 0 else "FAIL"
+        else:
+            summary_status = "WAITING_USER"
+        summary = {
+            "session_id": session.id,
+            "command": "chat",
+            "arguments": message,
+            "status": summary_status,
+            "notes": final[:4000],
+            "created_at": created_at,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "gates": [{"name": "CHAT", "status": summary_status, "reason": "Real Codex chat turn."}],
+        }
+        session.write_json("summary.json", summary)
+        return RuntimeResult(session=session, primary=run, tasks=[], gates=[], exit_code=0 if waiting else run.returncode)
+
+    def run_chat_loop(self, message: str, max_steps: int = 8, *, resume_from: str | None = None) -> RuntimeResult:
+        session = self._new_session("chat")
+        created_at = datetime.now().isoformat(timespec="seconds")
+        session.set_metadata(
+            user_prompt=message,
+            arguments=message,
+            invocation="chat",
+            chat=True,
+            strict_tools=True,
+            conversational_loop=True,
+            resumed_from=resume_from or "",
+            created_at=created_at,
+        )
+        session.event("session.start", "Starting conversational chat loop", user_prompt=message, strict_tools=True)
+        session.set_status("running")
+        chat_node = session.start_node(
+            "chat",
+            "chat-turn",
+            display_name="Chat turn",
+            metadata={"user_prompt": message[:1000], "strict_tools": True},
+        )
+        self.hooks.fire(
+            "UserPromptSubmit",
+            matcher_value=message,
+            payload={"user_prompt": message, "chat": True, "strict_tools": True},
+            session=session,
+            dry_run=self.dry_run,
+        )
+        session_hooks = self.hooks.fire(
+            "SessionStart",
+            matcher_value=message,
+            payload={"command": "chat", "arguments": message, "chat": True, "strict_tools": True},
+            session=session,
+            dry_run=self.dry_run,
+        )
+
+        tasks: list[CodexRunResult] = []
+        task_lock = threading.Lock()
+
+        def task_runner(task_agent: str, purpose: str, prompt: str, index: int = 1) -> str:
+            result = self._run_agent_task(
+                session=session,
+                parent_command="chat",
+                agent_name=task_agent,
+                purpose=purpose,
+                inputs=prompt,
+                parent_result="Conversational runtime Task action",
+                index=index,
+                hooks=self.hooks,
+                strict_tools=True,
+                max_steps=max(2, max_steps // 2),
+            )
+            with task_lock:
+                tasks.append(result)
+            return result.last_message
+
+        worker_registry = WorkerRegistry(task_runner, session_dir=session.dir)
+        chat_skill = MarkdownDocument(
+            path=self.project_root / "CHAT.md",
+            metadata={
+                "name": "chat",
+                "description": "Natural-language runtime conversation entry point",
+            },
+            body=_chat_loop_skill_body(message=message),
+            raw="",
+        )
+        chat_agent = self._synthetic_agent(
+            "main-session",
+            (
+                "You are the main conversational runtime agent. Decide whether to answer directly, "
+                "invoke a visible skill, call tools, delegate to agents, or ask the user through AskUserQuestion. "
+                "Do not invent completed work; produce evidence through runtime tools."
+            ),
+            path=chat_skill.path,
+        )
+        profile = invocation_profile(
+            skill=chat_skill,
+            agent=chat_agent,
+            project_root=self.project_root,
+            assume_yes=self.assume_yes,
+            explicit_output_style=self.output_style,
+        )
+        executor = ToolExecutor(
+            project_root=self.project_root,
+            hooks=self.hooks,
+            session=session,
+            assume_yes=self.assume_yes,
+            task_runner=task_runner,
+            worker_registry=worker_registry,
+            allowed_tools=chat_skill.metadata.get("allowed-tools"),
+            additional_dirs=self.additional_dirs,
+            invocation_arguments=message,
+            agent_mcp_servers=self._agent_mcp_servers(chat_agent),
+            agent_name="main-session",
+            agent_memory_scope=agent_memory_scope(chat_agent),
+        )
+        loop = StrictActionLoop(
+            codex=self.codex,
+            session=session,
+            project_root=self.project_root,
+            schema_path=_runtime_schema_path(),
+            tool_executor=executor,
+            max_steps=max_steps,
+            model=profile.model,
+            reasoning_effort=profile.effort,
+            use_output_schema=self.strict_schema,
+            allow_plain_text_final=True,
+        )
+        agent_node = session.start_node(
+            "agent",
+            "main-session",
+            parent_id=chat_node,
+            metadata={"purpose": "Conversational chat loop", "strict_tools": True},
+        )
+        loop_result = loop.run(
+            command="chat",
+            arguments=message,
+            skill=chat_skill,
+            agent=chat_agent,
+            context_bundle=self._context_bundle(session=session, hook_results=session_hooks)
+            + _resume_context_block(self.project_root, resume_from),
+            skill_support="No static chat support files. Use `skill` to load matching skills.",
+            runtime_profile=self._runtime_profile(profile, skill=chat_skill, agent=chat_agent),
+            assume_yes=self.assume_yes,
+            qa_mode=self.qa_mode,
+            dry_run=self.dry_run,
+        )
+        session.finish_node(agent_node, status="done" if loop_result.status in {"FINAL", "DRY-RUN"} else "blocked")
+        session.write_json(
+            "strict-result.json",
+            {
+                "status": loop_result.status,
+                "final": loop_result.final,
+                "tool_results": [
+                    {"tool": result.tool, "status": result.status, "summary": result.summary, "data": result.data}
+                    for result in loop_result.tool_results
+                ],
+            },
+        )
+
+        gates: list[GateResult] = []
+        if loop_result.status == "BLOCKED":
+            gates.append(GateResult("CHAT-LOOP", "BLOCKED", loop_result.final))
+        elif loop_result.status == "DRY-RUN":
+            gates.append(GateResult("CHAT-LOOP", "DRY-RUN", "Conversational action prompt was prepared but not executed."))
+        else:
+            gates.append(GateResult("CHAT-LOOP", "PASS", "Conversational action loop reached final status."))
+        session.start_node(
+            "gate",
+            "CHAT-LOOP",
+            parent_id=chat_node,
+            status=_node_status_for_gate(gates[-1]),
+            metadata={"reason": gates[-1].reason},
+        )
+
+        stop_results = self.hooks.fire(
+            "Stop",
+            payload={"command": "chat", "session": session.id, "strict_tools": True},
+            session=session,
+            dry_run=self.dry_run,
+        )
+        stop_block = hook_block_reason(stop_results, assume_yes=self.assume_yes)
+        if stop_block:
+            gates.append(GateResult("STOP-HOOK", "BLOCKED", stop_block))
+        self.hooks.fire(
+            "SessionEnd",
+            payload={"command": "chat", "session": session.id, "strict_tools": True, "reason": "complete"},
+            session=session,
+            dry_run=self.dry_run,
+        )
+        session.event("session.stop", "Finished conversational chat loop")
+
+        primary = loop_result.codex_runs[-1] if loop_result.codex_runs else None
+        exit_code = primary.returncode if primary is not None else 0
+        if loop_result.status == "BLOCKED":
+            exit_code = max(exit_code, 2)
+        for task in tasks:
+            exit_code = max(exit_code, task.returncode)
+        for gate in gates:
+            if gate.status in {"FAIL", "BLOCKED"}:
+                exit_code = max(exit_code, 2)
+        self._record_memory(
+            session,
+            command="chat",
+            arguments=message,
+            status="PASS" if exit_code == 0 else ("WAITING_USER" if _pending_question_exists(session) else "FAIL"),
+            notes=loop_result.final[:4000],
+            gates=gates,
+        )
+        session.finish_node(chat_node, status="done" if exit_code == 0 else ("blocked" if _pending_question_exists(session) else "failed"))
+        if _pending_question_exists(session):
+            session.set_status("waiting_user")
+            exit_code = 0
+        else:
+            session.set_status("done" if exit_code == 0 else "failed")
+        summary_status = "WAITING_USER" if _pending_question_exists(session) else ("PASS" if exit_code == 0 else "FAIL")
+        session.write_json(
+            "summary.json",
+            {
+                "session_id": session.id,
+                "command": "chat",
+                "arguments": message,
+                "status": summary_status,
+                "notes": loop_result.final[:4000],
+                "created_at": created_at,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "gates": [{"name": gate.name, "status": gate.status, "reason": gate.reason} for gate in gates],
+            },
+        )
+        return RuntimeResult(session=session, primary=primary, tasks=tasks, gates=gates, exit_code=exit_code)
 
     def _run_prompt_hook(
         self,
@@ -593,26 +1021,59 @@ class CodexSkillRuntime:
             dry_run=self.dry_run,
         )
         session.event("session.stop", "Finished transcript resume")
-        self._record_memory(
-            session,
-            command="resume",
-            arguments=session_or_path,
-            status="PASS" if result.returncode == 0 else "FAIL",
-            notes=result.last_message[:4000],
-            gates=[],
-        )
-        session.finish_node(resume_node, status="done" if result.returncode == 0 else "failed")
-        session.set_status("done" if result.returncode == 0 else "failed")
-        return RuntimeResult(session=session, primary=result, tasks=[], gates=[], exit_code=result.returncode)
+        waiting = False
+        if result.returncode == 0:
+            waiting = self._record_waiting_question(
+                session,
+                node_id=resume_node,
+                source_label="resume",
+                message=result.last_message,
+                parent_message=prompt_text or session_or_path,
+                evidence={"last_message": str(result.last_message_path), "stdout": str(result.stdout_path), "stderr": str(result.stderr_path)},
+                metadata={"returncode": result.returncode},
+            )
+        if not waiting:
+            self._record_memory(
+                session,
+                command="resume",
+                arguments=session_or_path,
+                status="PASS" if result.returncode == 0 else "FAIL",
+                notes=result.last_message[:4000],
+                gates=[],
+            )
+        if not waiting:
+            session.finish_node(resume_node, status="done" if result.returncode == 0 else "failed")
+            session.set_status("done" if result.returncode == 0 else "failed")
+        else:
+            maybe_update_session_memory(
+                session,
+                command="resume",
+                arguments=session_or_path,
+                note=result.last_message[:4000],
+                status="WAITING_USER",
+                force=True,
+            )
+        return RuntimeResult(session=session, primary=result, tasks=[], gates=[], exit_code=0 if waiting else result.returncode)
 
-    def answer_question(self, session_or_path: str, answer: str) -> RuntimeResult:
+    def answer_question(self, session_or_path: str, answer: str, *, max_steps: int = 8) -> RuntimeResult:
         answered = answer_pending_question(self.project_root, session_or_path, answer)
         prompt = (
             "The user answered the pending runtime question. Continue the prior workflow from the point where it paused.\n\n"
             f"Question: {answered.get('question', '')}\n"
             f"Answer: {answer}\n"
         )
+        if self._session_was_conversational(session_or_path):
+            return self.run_chat_loop(prompt, max_steps=max_steps, resume_from=session_or_path)
         return self.resume_session(session_or_path, prompt)
+
+    def _session_was_conversational(self, session_or_path: str) -> bool:
+        try:
+            session_dir = find_session_dir(self.project_root, session_or_path)
+            state = json.loads((session_dir / "session-state.json").read_text(encoding="utf-8", errors="replace"))
+        except (FileNotFoundError, OSError, ValueError):
+            return False
+        metadata = state.get("metadata") if isinstance(state, dict) else {}
+        return isinstance(metadata, dict) and bool(metadata.get("conversational_loop") or metadata.get("chat"))
 
     def run_strict_smoke(self, read_path: str = "README.md", max_steps: int = 3) -> RuntimeResult:
         session = self._new_session("strict-smoke")
@@ -1133,6 +1594,10 @@ class CodexSkillRuntime:
 
     def _context_bundle(self, *, session: RuntimeSession, hook_results: list[object] | None = None) -> str:
         sections: list[ContextSection] = []
+        context_mode = _context_mode()
+        include_history = _context_history_enabled(context_mode)
+        include_registry = _context_registry_enabled(context_mode)
+        include_external_context = _context_external_enabled(context_mode)
 
         def add_section(name: str, text: str, *, priority: int = 100, required: bool = False) -> None:
             if text:
@@ -1141,30 +1606,33 @@ class CodexSkillRuntime:
         context = self.loader.read_context_bundle()
         add_section("context-files", context, priority=10, required=True)
         touched_paths = session.touched_paths()
-        add_section("bridge-context", bridge_context(self.project_root), priority=30)
-        add_section("voice-context", voice_context(self.project_root), priority=35)
-        add_section("ide-context", ide_context(self.project_root), priority=35)
-        add_section("mcp-context", mcp_instructions_context(self.project_root, additional_dirs=self.additional_dirs), priority=20)
-        add_section("capability-context", capability_context(self.project_root, additional_dirs=self.additional_dirs), priority=20)
-        add_section("project-memory", project_memory_context(self.project_root), priority=25)
+        if include_external_context:
+            add_section("bridge-context", bridge_context(self.project_root), priority=30)
+            add_section("voice-context", voice_context(self.project_root), priority=35)
+            add_section("ide-context", ide_context(self.project_root), priority=35)
+            add_section("mcp-context", mcp_instructions_context(self.project_root, additional_dirs=self.additional_dirs), priority=20)
+            add_section("capability-context", capability_context(self.project_root, additional_dirs=self.additional_dirs), priority=20)
+            add_section("project-memory", project_memory_context(self.project_root), priority=25)
         add_section("compact-state", compact_state_context(session), priority=25)
         add_section("plan-mode", plan_mode_context(session), priority=25)
         add_section("session-memory", session_memory_context(session), priority=15, required=True)
         add_section("invoked-skills", session.invoked_skills_context(max_chars=20000), priority=15, required=True)
-        skill_registry = self.loader.skill_registry_context(
-            touched_paths=touched_paths,
-            context_window_tokens=_context_window_tokens(),
-        )
-        add_section("skill-registry", skill_registry, priority=40)
-        durable_memory = relevant_memory_context(
-            self.project_root,
-            query=_context_query(session),
-            recent_tools=_recent_tool_names(session),
-            selector=self._memory_side_query_selector(session) if _side_query_enabled() else None,
-        )
-        add_section("durable-memory", durable_memory, priority=45)
-        memory = runtime_memory_context(self.project_root, exclude_session=session.id)
-        add_section("runtime-memory", memory, priority=60)
+        if include_registry:
+            skill_registry = self.loader.skill_registry_context(
+                touched_paths=touched_paths,
+                context_window_tokens=_context_window_tokens(),
+            )
+            add_section("skill-registry", skill_registry, priority=40)
+        if include_history:
+            durable_memory = relevant_memory_context(
+                self.project_root,
+                query=_context_query(session),
+                recent_tools=_recent_tool_names(session),
+                selector=self._memory_side_query_selector(session) if _side_query_enabled(context_mode) else None,
+            )
+            add_section("durable-memory", durable_memory, priority=45)
+            memory = runtime_memory_context(self.project_root, exclude_session=session.id)
+            add_section("runtime-memory", memory, priority=60)
         budgeted = apply_context_budget(sections, context_window=context_window_tokens())
         record_compact_state(session, budgeted)
         bundle_sections = [section.text for section in budgeted.sections]
@@ -1286,6 +1754,92 @@ def _runtime_schema_path() -> Path:
     return Path(__file__).resolve().parents[1] / "schemas" / "action-result.schema.json"
 
 
+def _chat_turn_prompt(*, message: str, context: str, skill_registry: str) -> str:
+    return f"""# Codex Skill Runtime Chat Turn
+
+You are the real assistant for a generic skill runtime UI.
+
+Your response will be shown in the main chat as the assistant message. Do not pretend that runtime routing rules are your own thoughts. If you need more information from the user, ask a concise clarifying question. If a skill should be used, say which visible skill you would use and why, but do not claim it has already run unless the transcript says it did.
+
+Runtime/tool/model process events are shown separately by the UI. Keep your chat response human-readable. Do not dump raw skill score lists. Do not invent hidden reasoning.
+
+## User Message
+
+{message}
+
+## Visible Skill Registry
+
+{skill_registry or "No visible skills were discovered."}
+
+## Runtime Context
+
+{context}
+"""
+
+
+def _chat_loop_skill_body(*, message: str) -> str:
+    return f"""# Natural-Language Runtime Conversation
+
+The user is interacting through the generic runtime chat UI. Treat this as the primary Claude Code style conversation entry point, not as a passive Q&A surface.
+
+## User Message
+
+{message}
+
+## Conversational Execution Rules
+
+- Decide whether the request can be answered directly or needs runtime work.
+- If a visible skill matches the user request, request a `skill` action before improvising.
+- After a `skill` action returns a loaded skill body, follow that skill body directly.
+- If the loaded skill or current task needs another skill, request another `skill` action; nested skill invocation is allowed.
+- Use runtime tools for file reads/writes, commands, MCP, memory, artifacts, and delegation.
+- Use `brief` or `SendUserMessage` for short human-visible progress updates that should appear in the main conversation.
+- Use `ask_user_question` only when a required user decision cannot be safely inferred.
+- If the user gave enough autonomy, continue with reasonable defaults and pause only for missing credentials, irreversible/destructive choices, external costs, or major product-direction decisions.
+- Return `status: final` only when the useful work is complete or when a direct answer is sufficient.
+"""
+
+
+def _resume_context_block(project_root: Path, resume_from: str | None) -> str:
+    if not resume_from:
+        return ""
+    try:
+        replay = replay_context(project_root, resume_from)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        replay = f"Runtime could not reconstruct the prior session replay: {exc}"
+    try:
+        question = pending_question_context(project_root, resume_from)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        question = f"Runtime could not reconstruct the pending question context: {exc}"
+    return (
+        "\n\n---\n\n"
+        "## Prior Conversational Session Resume Context\n\n"
+        f"Source session: `{resume_from}`\n\n"
+        "Continue the prior workflow from this context. Preserve loaded skill instructions, tool observations, "
+        "worker state, memory, and the user's answer. Verify live files before editing.\n\n"
+        f"{question}\n\n"
+        f"{replay}\n"
+    )
+
+
+def _pending_question_exists(session: RuntimeSession) -> bool:
+    pending_path = session.path("pending-question.json")
+    answer_path = session.path("pending-question-answer.json")
+    if not pending_path.exists():
+        return False
+    try:
+        pending = json.loads(pending_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(pending, dict) or not pending.get("question"):
+        return False
+    try:
+        answer = json.loads(answer_path.read_text(encoding="utf-8", errors="replace")) if answer_path.exists() else {}
+    except (OSError, ValueError):
+        answer = {}
+    return not (isinstance(answer, dict) and answer.get("status") == "answered")
+
+
 def _context_window_tokens() -> int | None:
     return context_window_tokens()
 
@@ -1330,9 +1884,47 @@ def _qa_auto_patterns() -> list[str]:
     return [item.strip() for item in raw.replace("\n", ";").split(";") if item.strip()]
 
 
-def _side_query_enabled() -> bool:
+def _context_mode() -> str:
+    value = os.environ.get("SKILL_RUNTIME_CONTEXT_MODE") or os.environ.get("CODEX_SKILL_RUNTIME_CONTEXT_MODE") or "full"
+    normalized = value.strip().lower()
+    if normalized in {"lean", "lite", "minimal", "local"}:
+        return "lean"
+    if normalized in {"full", "default", "complete"}:
+        return "full"
+    return "full"
+
+
+def _context_history_enabled(context_mode: str | None = None) -> bool:
+    explicit = os.environ.get("SKILL_RUNTIME_CONTEXT_HISTORY") or os.environ.get("CODEX_SKILL_RUNTIME_CONTEXT_HISTORY")
+    if explicit is not None and explicit.strip():
+        return _env_truthy_text(explicit)
+    return (context_mode or _context_mode()) != "lean"
+
+
+def _context_registry_enabled(context_mode: str | None = None) -> bool:
+    explicit = os.environ.get("SKILL_RUNTIME_CONTEXT_REGISTRY") or os.environ.get("CODEX_SKILL_RUNTIME_CONTEXT_REGISTRY")
+    if explicit is not None and explicit.strip():
+        return _env_truthy_text(explicit)
+    return (context_mode or _context_mode()) != "lean"
+
+
+def _context_external_enabled(context_mode: str | None = None) -> bool:
+    explicit = os.environ.get("SKILL_RUNTIME_CONTEXT_EXTERNAL") or os.environ.get("CODEX_SKILL_RUNTIME_CONTEXT_EXTERNAL")
+    if explicit is not None and explicit.strip():
+        return _env_truthy_text(explicit)
+    return (context_mode or _context_mode()) != "lean"
+
+
+def _side_query_enabled(context_mode: str | None = None) -> bool:
     value = os.environ.get("SKILL_RUNTIME_MEMORY_SIDE_QUERY") or os.environ.get("CODEX_SKILL_RUNTIME_MEMORY_SIDE_QUERY") or "auto"
-    return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+    normalized = value.strip().lower()
+    if normalized in {"auto", ""}:
+        return (context_mode or _context_mode()) != "lean"
+    return normalized not in {"0", "false", "no", "off", "disabled"}
+
+
+def _env_truthy_text(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
 
 
 def _memory_jobs_background() -> bool:

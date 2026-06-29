@@ -4,12 +4,12 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from .frontmatter import MarkdownDocument
 
 
-SectionBuilder = Callable[[], str | None]
+SectionBuilder = Callable[[], Optional[str]]
 
 
 @dataclass(frozen=True)

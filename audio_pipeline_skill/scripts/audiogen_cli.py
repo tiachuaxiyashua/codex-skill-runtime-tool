@@ -5,6 +5,7 @@ import json
 import math
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -32,8 +33,8 @@ ACE_MODEL_FILES = {
     },
     "text_encoders_2": {
         "folder": "text_encoders",
-        "name": "qwen_4b_ace15.safetensors",
-        "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_4b_ace15.safetensors",
+        "name": "qwen_0.6b_ace15.safetensors",
+        "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_0.6b_ace15.safetensors",
     },
     "vae": {
         "name": "ace_1.5_vae.safetensors",
@@ -243,7 +244,11 @@ def check_models(
     checked_pipelines = _normalize_pipelines(pipelines)
     comfyui_root = _resolve_comfyui_root(comfyui_root)
     expected = _expected_model_paths(comfyui_root, pipelines=checked_pipelines) if comfyui_root else []
-    missing_files = [item for item in expected if not Path(item["path"]).exists()]
+    missing_files = []
+    for item in expected:
+        issue = _model_file_issue(Path(item["path"]), expected_name=str(item.get("name") or ""))
+        if issue:
+            missing_files.append({**item, "issue": issue})
     backend_model_presence = _model_names_visible_in_backend(base_url=base_url, timeout=timeout)
     missing_in_backend: list[str] = []
     missing_in_backend_by_pipeline: dict[str, list[str]] = {pipeline: [] for pipeline in checked_pipelines}
@@ -334,12 +339,19 @@ def download_models(
     for item in _expected_model_paths(comfyui_root, pipelines=checked_pipelines):
         target = Path(item["path"])
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() and not overwrite:
+        existing_issue = _model_file_issue(target, expected_name=str(item.get("name") or ""))
+        if target.exists() and not overwrite and not existing_issue:
             downloads.append({**item, "status": "skipped_exists"})
             continue
         partial = target.with_suffix(target.suffix + ".partial")
         try:
+            if target.exists() and existing_issue:
+                corrupt = target.with_suffix(target.suffix + f".invalid-{int(time.time())}")
+                target.replace(corrupt)
             _download_file(str(item["url"]), partial, timeout=timeout)
+            partial_issue = _model_file_issue(partial, expected_name=str(item.get("name") or target.name))
+            if partial_issue:
+                raise AudioPipelineError(f"downloaded file failed integrity check: {partial_issue}")
             partial.replace(target)
             downloads.append({**item, "status": "downloaded", "bytes": target.stat().st_size})
         except Exception as exc:
@@ -1303,6 +1315,52 @@ def _download_file(url: str, target: Path, *, timeout: int) -> None:
     with urllib.request.urlopen(request, timeout=timeout) as response:
         with target.open("wb") as handle:
             shutil.copyfileobj(response, handle)
+
+
+def _model_file_issue(path: Path, *, expected_name: str = "") -> str:
+    if not path.exists():
+        return "missing"
+    if path.stat().st_size <= 0:
+        return "empty"
+    suffix_source = expected_name or path.name
+    if suffix_source.lower().endswith(".safetensors"):
+        return _safetensors_file_issue(path)
+    return ""
+
+
+def _safetensors_file_issue(path: Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            raw_header_len = handle.read(8)
+            if len(raw_header_len) != 8:
+                return "safetensors header length is truncated"
+            header_len = struct.unpack("<Q", raw_header_len)[0]
+            file_size = path.stat().st_size
+            if header_len <= 0:
+                return "safetensors header length is invalid"
+            if 8 + header_len > file_size:
+                return "safetensors header is truncated"
+            header = json.loads(handle.read(header_len))
+    except Exception as exc:
+        return f"safetensors header cannot be read: {exc}"
+    max_data_end = 0
+    try:
+        for key, value in header.items():
+            if key == "__metadata__":
+                continue
+            if not isinstance(value, dict) or "data_offsets" not in value:
+                return f"safetensors tensor metadata is invalid for {key}"
+            offsets = value["data_offsets"]
+            if not isinstance(offsets, list) or len(offsets) != 2:
+                return f"safetensors data offsets are invalid for {key}"
+            max_data_end = max(max_data_end, int(offsets[1]))
+    except Exception as exc:
+        return f"safetensors tensor metadata cannot be parsed: {exc}"
+    expected_size = 8 + header_len + max_data_end
+    actual_size = path.stat().st_size
+    if actual_size != expected_size:
+        return f"safetensors file is incomplete or has trailing bytes: expected {expected_size}, got {actual_size}"
+    return ""
 
 
 def _apply_hf_endpoint(url: str) -> str:

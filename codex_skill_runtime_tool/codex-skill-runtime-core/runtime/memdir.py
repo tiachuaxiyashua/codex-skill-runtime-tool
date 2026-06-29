@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from .state_paths import runtime_state_path
 
@@ -21,7 +21,7 @@ MAX_MEMORY_BYTES = 4096
 DEFAULT_CONSOLIDATION_HOURS = 24
 DEFAULT_CONSOLIDATION_SESSIONS = 5
 
-MemorySideQuerySelector = Callable[[str, list["MemoryHeader"], str, list[str]], list[str] | None]
+MemorySideQuerySelector = Callable[[str, list["MemoryHeader"], str, list[str]], Optional[list[str]]]
 
 
 @dataclass(frozen=True)

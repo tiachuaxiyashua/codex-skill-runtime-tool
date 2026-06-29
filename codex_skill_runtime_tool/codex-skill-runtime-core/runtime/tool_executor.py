@@ -367,7 +367,7 @@ class ToolExecutor:
         path = self._resolve_write_path(str(parameters["path"]))
         content = str(parameters.get("content", ""))
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8", newline="\n")
+        _write_text_lf(path, content)
         self.session.add_artifact(path, metadata={"tool": "write_file", "bytes": len(content.encode("utf-8"))})
         return ToolResult("write_file", "OK", f"Wrote {path}", {"path": str(path), "bytes": len(content.encode("utf-8"))})
 
@@ -379,7 +379,7 @@ class ToolExecutor:
         if old not in text:
             raise ToolExecutionError(f"old text not found in {path}")
         updated = text.replace(old, new, 1)
-        path.write_text(updated, encoding="utf-8", newline="\n")
+        _write_text_lf(path, updated)
         self.session.add_artifact(path, metadata={"tool": "edit_file", "replacements": 1})
         return ToolResult("edit_file", "OK", f"Edited {path}", {"path": str(path), "replacements": 1})
 
@@ -399,7 +399,7 @@ class ToolExecutor:
                 raise ToolExecutionError(f"old text not found in {path}: {old[:80]}")
             text = text.replace(old, new, 1)
             replacements += 1
-        path.write_text(text, encoding="utf-8", newline="\n")
+        _write_text_lf(path, text)
         self.session.add_artifact(path, metadata={"tool": "multi_edit", "replacements": replacements})
         return ToolResult("multi_edit", "OK", f"Edited {path}", {"path": str(path), "replacements": replacements})
 
@@ -927,6 +927,13 @@ class ToolExecutor:
             "metadata": parameters.get("metadata") if isinstance(parameters.get("metadata"), dict) else {},
         }
         path = append_session_record(self.session.dir, "briefs.jsonl", record)
+        self.session.event(
+            "assistant.brief",
+            record["content"],
+            title=record["title"],
+            path=str(path),
+            metadata=record["metadata"],
+        )
         return ToolResult("brief", "OK", f"Recorded brief {record['title']}", {"path": str(path), "brief": record})
 
     def _remote_trigger(self, parameters: dict[str, Any]) -> ToolResult:
@@ -2058,6 +2065,11 @@ def _display_read_path(path: Path, project_root: Path) -> str:
         return str(resolved.relative_to(project_root))
     except ValueError:
         return str(resolved)
+
+
+def _write_text_lf(path: Path, text: str) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
 
 
 def _status_for_tool_result(result: ToolResult) -> str:

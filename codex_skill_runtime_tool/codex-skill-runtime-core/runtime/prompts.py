@@ -22,31 +22,15 @@ def skill_prompt(
     qa_mode: str,
     runtime_profile: str = "",
 ) -> str:
-    approval_policy = (
-        "The runtime was started with --assume-yes. Proceed with necessary file changes inside the workspace."
-        if assume_yes
-        else "If the original skill requires user approval before a major decision or file write, stop and ask in your final message."
-    )
     rendered_skill_body = render_markdown_body(document=skill, arguments=arguments, project_root=project_root)
+    runtime_contract = _runtime_contract(assume_yes=assume_yes, qa_mode=qa_mode)
+    rendered_agent_body = _maybe_lean_agent_body(agent.body)
     return f"""# Claude Skill Codex Runtime Invocation
 
 You are Codex running inside a clean-room lightweight runtime for Claude Code skills.
 The original skill files are the source of truth. Do not rewrite or patch original skill source files.
 
-## Runtime Contract
-
-- Execute the workflow from the skill exactly as far as the available inputs allow.
-- Use the agent definition as your role/persona and responsibility boundary.
-- Treat `Task` in the original skill as real delegation, not as prose. If a subagent is required, emit a line exactly like:
-  `RUNTIME_TASK_REQUEST: agent=<agent-name>; purpose=<short purpose>; inputs=<paths or concise context>`
-- Treat `AskUserQuestion` as a runtime pause. If a required answer is missing, ask one concise question and stop.
-- If the skill references supporting files by relative path, request a `read_file` action for the relevant file before relying on its contents.
-- If the skill tells you to invoke another skill, request a `skill` action with that skill name.
-- Use the Runtime SkillTool Registry in Repository Context to discover other loaded skills. Do not assume any domain-specific capability is built into the runtime core.
-- Store cross-skill continuity such as global visual/audio style, asset inventory, and durable project decisions in runtime project memory through `project_memory_write` or `asset_register` when strict tools are available.
-- {approval_policy}
-- For implementation work, produce actual files, commands run, and evidence. Do not claim testing unless you ran a command or clearly label it as not run.
-- QA mode requested by runtime: {qa_mode}
+{runtime_contract}
 
 {runtime_profile}
 
@@ -78,12 +62,47 @@ The original skill files are the source of truth. Do not rewrite or patch origin
 
 ## Agent Body
 
-{agent.body}
+{rendered_agent_body}
 
 ## Repository Context
 
 {context_bundle}
 """
+
+
+def _runtime_contract(*, assume_yes: bool, qa_mode: str) -> str:
+    approval = (
+        "Proceed with necessary file changes inside the workspace."
+        if assume_yes
+        else "Ask before major decisions or file writes that require approval."
+    )
+    if _lean_context_enabled():
+        return f"""## Runtime Contract
+
+- Execute the loaded skill as far as inputs allow; use the routed agent as your responsibility boundary.
+- Treat `Task` in the original skill as real delegation, not as prose. If a subagent is required, emit a line exactly like:
+  `RUNTIME_TASK_REQUEST: agent=<agent-name>; purpose=<short purpose>; inputs=<paths or concise context>`
+- Treat `AskUserQuestion` as a runtime pause. If a required answer is missing, ask one concise question and stop.
+- If the skill tells you to invoke another skill, request a `skill` action with that skill name.
+- Use runtime actions for file reads/writes, commands, user questions, and delegation.
+- If supporting context is missing, request `read_file` instead of guessing.
+- {approval}
+- Produce actual files and evidence; do not claim unrun tests.
+- QA mode requested by runtime: {qa_mode}"""
+    return f"""## Runtime Contract
+
+- Execute the workflow from the skill exactly as far as the available inputs allow.
+- Use the agent definition as your role/persona and responsibility boundary.
+- Treat `Task` in the original skill as real delegation, not as prose. If a subagent is required, emit a line exactly like:
+  `RUNTIME_TASK_REQUEST: agent=<agent-name>; purpose=<short purpose>; inputs=<paths or concise context>`
+- Treat `AskUserQuestion` as a runtime pause. If a required answer is missing, ask one concise question and stop.
+- If the skill references supporting files by relative path, request a `read_file` action for the relevant file before relying on its contents.
+- If the skill tells you to invoke another skill, request a `skill` action with that skill name.
+- Use the Runtime SkillTool Registry in Repository Context to discover other loaded skills. Do not assume any domain-specific capability is built into the runtime core.
+- Store cross-skill continuity such as global visual/audio style, asset inventory, and durable project decisions in runtime project memory through `project_memory_write` or `asset_register` when strict tools are available.
+- {approval}
+- For implementation work, produce actual files, commands run, and evidence. Do not claim testing unless you ran a command or clearly label it as not run.
+- QA mode requested by runtime: {qa_mode}"""
 
 
 def agent_task_prompt(
@@ -159,7 +178,154 @@ def render_markdown_body(*, document: MarkdownDocument, arguments: str, project_
     rendered = _expand_plugin_root(document.body, plugin_root)
     rendered = _render_file_references(rendered, arguments=arguments, project_root=project_root, plugin_root=plugin_root)
     rendered = _render_arguments(rendered, arguments)
-    return _render_dynamic_context(rendered, project_root=project_root, plugin_root=plugin_root)
+    rendered = _render_dynamic_context(rendered, project_root=project_root, plugin_root=plugin_root)
+    return _maybe_lean_skill_body(rendered, arguments=arguments)
+
+
+def _maybe_lean_skill_body(body: str, *, arguments: str) -> str:
+    if not _lean_context_enabled():
+        return body
+    try:
+        max_chars = int(os.environ.get("SKILL_RUNTIME_LEAN_SKILL_BODY_CHARS", "8000"))
+    except ValueError:
+        max_chars = 8000
+    try:
+        section_max_chars = int(os.environ.get("SKILL_RUNTIME_LEAN_SECTION_MAX_CHARS", "1200"))
+    except ValueError:
+        section_max_chars = 1200
+    if max_chars <= 0 or len(body) <= max_chars:
+        return body
+
+    sections = _markdown_h2_sections(body)
+    if not sections:
+        return body[:max_chars] + "\n\n[TRUNCATED BY LEAN SKILL BODY]\n"
+
+    wanted = _lean_section_names(arguments)
+    kept: list[str] = []
+    omitted: list[str] = []
+    for heading, text in sections:
+        if heading in wanted or any(marker in heading.lower() for marker in wanted):
+            kept.append(_truncate_lean_section(text, section_max_chars=section_max_chars))
+        else:
+            omitted.append(heading)
+
+    if not kept:
+        return body[:max_chars] + "\n\n[TRUNCATED BY LEAN SKILL BODY]\n"
+
+    header = (
+        "[LEAN SKILL BODY]\n"
+        "Runtime context mode is lean, so this long skill body was reduced to the sections most relevant to the current invocation. "
+        "Use `read_file` on the original SKILL.md if an omitted section becomes necessary.\n"
+    )
+    omitted_line = f"\nOmitted sections: {', '.join(omitted[:20])}" if omitted else ""
+    rendered = header + omitted_line + "\n\n" + "\n\n---\n\n".join(kept)
+    if len(rendered) > max_chars:
+        rendered = rendered[:max_chars] + "\n\n[TRUNCATED BY LEAN SKILL BODY]\n"
+    return rendered
+
+
+def _maybe_lean_agent_body(body: str) -> str:
+    if not _lean_context_enabled():
+        return body
+    try:
+        max_chars = int(os.environ.get("SKILL_RUNTIME_LEAN_AGENT_BODY_CHARS", "5000"))
+    except ValueError:
+        max_chars = 5000
+    if max_chars <= 0 or len(body) <= max_chars:
+        return body
+    sections = _markdown_h2_sections(body)
+    wanted = {
+        "two modes",
+        "collaboration protocol",
+        "prototype paths",
+        "core philosophy: speed over quality (concept prototype)",
+        "isolation requirements",
+        "document what you learned, not what you built",
+        "what this agent must not do",
+        "delegation map",
+    }
+    kept = [
+        _truncate_lean_section(text, section_max_chars=900)
+        for heading, text in sections
+        if heading in wanted
+    ]
+    if not kept:
+        return body[:max_chars].rstrip() + "\n\n[TRUNCATED BY LEAN AGENT BODY]\n"
+    rendered = (
+        "[LEAN AGENT BODY]\n"
+        "Long agent instructions were reduced to role, boundaries, and implementation-relevant rules.\n\n"
+        + "\n\n---\n\n".join(kept)
+    )
+    if len(rendered) > max_chars:
+        rendered = rendered[:max_chars].rstrip() + "\n\n[TRUNCATED BY LEAN AGENT BODY]\n"
+    return rendered
+
+
+def _truncate_lean_section(text: str, *, section_max_chars: int) -> str:
+    if section_max_chars <= 0 or len(text) <= section_max_chars:
+        return text
+    return text[:section_max_chars].rstrip() + "\n\n[TRUNCATED BY LEAN SECTION]\n"
+
+
+def _lean_context_enabled() -> bool:
+    value = os.environ.get("SKILL_RUNTIME_CONTEXT_MODE") or os.environ.get("CODEX_SKILL_RUNTIME_CONTEXT_MODE") or ""
+    return value.strip().lower() in {"lean", "lite", "minimal", "local"}
+
+
+def _lean_section_names(arguments: str) -> set[str]:
+    lowered = arguments.lower()
+    wanted = {
+        "purpose",
+        "phase 5: implement",
+        "phase 7: generate prototype report",
+        "phase 9: summary and next steps",
+        "prototype paths",
+        "core philosophy: speed over quality (concept prototype)",
+        "isolation requirements",
+        "document what you learned, not what you built",
+        "what this agent must not do",
+        "delegation map",
+    }
+    if "--spike" in lowered or "spike" in lowered:
+        wanted.add("spike mode")
+    if "--path html" in lowered or "html" in lowered:
+        wanted.add("html")
+        wanted.add("html path")
+    if "--path engine" in lowered or "godot" in lowered or "engine" in lowered:
+        wanted.add("engine")
+        wanted.add("engine path")
+    if "--path paper" in lowered or "paper" in lowered:
+        wanted.add("paper")
+        wanted.add("paper path")
+    return wanted
+
+
+def _markdown_h2_sections(body: str) -> list[tuple[str, str]]:
+    lines = body.splitlines()
+    preamble: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    current_heading = ""
+    current: list[str] = []
+    for line in lines:
+        if line.startswith("## "):
+            if current_heading:
+                sections.append((current_heading, current))
+            elif current:
+                preamble.extend(current)
+            current_heading = line[3:].strip().lower()
+            current = [line]
+            continue
+        current.append(line)
+    if current_heading:
+        sections.append((current_heading, current))
+    elif current:
+        preamble.extend(current)
+
+    rendered: list[tuple[str, str]] = []
+    if preamble:
+        rendered.append(("preamble", "\n".join(preamble).strip()))
+    rendered.extend((heading, "\n".join(content).strip()) for heading, content in sections)
+    return [(heading, text) for heading, text in rendered if text]
 
 
 def _split_arguments(arguments: str) -> list[str]:

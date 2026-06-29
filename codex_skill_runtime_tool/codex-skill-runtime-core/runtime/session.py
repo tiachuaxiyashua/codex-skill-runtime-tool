@@ -21,7 +21,7 @@ class RuntimeEvent:
 
 class RuntimeSession:
     def __init__(self, root: Path, label: str, *, metadata: dict[str, Any] | None = None) -> None:
-        now = datetime.now().strftime("%Y%m%d-%H%M%S")
+        now = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         clean_label = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in label)
         self.id = f"{now}-{clean_label}".strip("-")
         self.label = label

@@ -1,8 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import queue
+import shlex
 import shutil
 import subprocess
 import sys
@@ -15,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .api_transcript import api_transcript_context, load_api_messages
+from .action_loop import StrictActionLoop
 from .bridge import LocalBridge, bridge_context
 from .capabilities import discover_capabilities
 from .codex_cli import CodexCLI
@@ -82,6 +85,7 @@ class SelfTester:
         self.loaded_root = project_root.resolve()
         self.additional_dirs = [path.resolve() for path in (additional_dirs or [])]
         self.source_root = self._contract_source_root()
+        self.source_claude_diff_before = self._claude_diff_snapshot(self.source_root)
         self.project_root = self._prepare_fixture_root()
         self.codex_executable = codex_executable
         self.model = model
@@ -89,13 +93,16 @@ class SelfTester:
         self.live_strict_target = live_strict_target
         self.results: list[Check] = []
 
-    def run_all(self) -> int:
+    def run_all(self, only: list[str] | None = None) -> int:
         checks = [
             self._loader_discovery,
             self._frontmatter_contract,
             self._task_and_gate_contract,
             self._codex_dry_run_contract,
             self._strict_dry_run_contract,
+            self._conversational_loop_contract,
+            self._chat_plain_text_final_contract,
+            self._ui_conversation_projection_contract,
             self._tool_executor_contract,
             self._session_terminal_status_contract,
             self._permission_contract,
@@ -104,6 +111,7 @@ class SelfTester:
             self._skill_registry_contract,
             self._generic_platform_contract,
             self._question_pause_contract,
+            self._assistant_question_lifecycle_contract,
             self._project_memory_contract,
             self._hook_decision_contract,
             self._external_layout_contract,
@@ -121,6 +129,10 @@ class SelfTester:
             self._large_tool_result_contract,
             self._api_message_transcript_contract,
             self._structured_tool_transcript_contract,
+            self._codex_stream_failure_contract,
+            self._codex_transient_retry_contract,
+            self._codex_stall_kills_process_tree_contract,
+            self._schema_fallback_contract,
             self._model_effort_command_contract,
             self._codex_api_proxy_config_contract,
             self._isolated_runtime_env_contract,
@@ -141,7 +153,13 @@ class SelfTester:
             self._live_codex_qa_contract,
             self._claude_tree_clean,
         ]
-        for check in checks:
+        selected = _select_checks(checks, only or [])
+        if only and not selected:
+            requested = ", ".join(only)
+            print(f"SELFTEST_SUMMARY total=0 failed=1")
+            print(f"FAIL: selector - no self-tests matched: {requested}")
+            return 1
+        for check in selected:
             self._run_check(check)
 
         for result in self.results:
@@ -269,6 +287,218 @@ class SelfTester:
         self._assert("--output-schema" in data["command"], "strict run must use output schema")
         return f"session={result.session.id}"
 
+    def _conversational_loop_contract(self) -> str:
+        probe_root = self.project_root / ".selftest" / "conversational-loop"
+        skills_dir = probe_root / "skills" / "probe-skill"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: probe-skill\n"
+            "description: Use for conversational runtime probe requests.\n"
+            "---\n\n"
+            "When invoked, report PROBE_SKILL_LOADED and then finish the user's request.\n",
+            encoding="utf-8",
+        )
+        fake_codex = probe_root / "fake-codex-chat.py"
+        fake_codex.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, pathlib, sys",
+                    "prompt = sys.stdin.read()",
+                    "marker = prompt.split('## Prior Runtime Observations', 1)[-1]",
+                    "user = prompt.split('## User Message', 1)[-1].split('## Conversational Execution Rules', 1)[0] if '## User Message' in prompt else prompt",
+                    "last_message = ''",
+                    "for index, value in enumerate(sys.argv):",
+                    "    if value == '--output-last-message' and index + 1 < len(sys.argv):",
+                    "        last_message = sys.argv[index + 1]",
+                    "if 'Trigger explicit question pause' in user:",
+                    "    response = {'status':'action_required','summary':'Need a user decision','actions':[{'tool':'ask_user_question','reason':'probe pause','parameters':{'question':'Choose path?','options':['A','B']}}],'final':''}",
+                    "elif 'The user answered the pending runtime question' in user:",
+                    "    response = {'status':'final','summary':'Resumed after answer','actions':[],'final':'PROBE_RESUMED_AFTER_ANSWER'}",
+                    "elif 'Question mark final probe' in user:",
+                    "    response = {'status':'final','summary':'Direct final','actions':[],'final':'This is complete. Do you want anything else?'}",
+                    "elif 'PROBE_BRIEF_VISIBLE' in marker or 'Recorded brief' in marker:",
+                    "    response = {'status':'final','summary':'Done','actions':[],'final':'PROBE_FINAL_DONE'}",
+                    "elif 'PROBE_SKILL_LOADED' in marker:",
+                    "    response = {'status':'action_required','summary':'Report progress','actions':[{'tool':'brief','reason':'visible progress','parameters':{'title':'Probe','content':'PROBE_BRIEF_VISIBLE'}}],'final':''}",
+                    "else:",
+                    "    response = {'status':'action_required','summary':'Load matching skill','actions':[{'tool':'skill','reason':'matching visible skill','parameters':{'name':'probe-skill','arguments':'probe'}}],'final':''}",
+                    "if last_message:",
+                    "    pathlib.Path(last_message).write_text(json.dumps(response, ensure_ascii=False), encoding='utf-8')",
+                    "print(json.dumps({'type':'turn.started'}))",
+                    "print(json.dumps({'type':'item.completed','item':{'type':'message','text':json.dumps(response, ensure_ascii=False)}}))",
+                    "print(json.dumps({'type':'turn.completed'}))",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        runtime = CodexSkillRuntime(
+            project_root=probe_root,
+            codex=CodexCLI(executable=str(fake_codex), model=self.model),
+            dry_run=False,
+            assume_yes=False,
+            qa_mode="off",
+            additional_dirs=[probe_root],
+        )
+        result = runtime.run_chat_loop("Use the conversational runtime probe skill", max_steps=5)
+        self._assert(result.exit_code == 0, f"chat loop skill probe failed exit={result.exit_code}")
+        strict = json.loads(result.session.path("strict-result.json").read_text(encoding="utf-8"))
+        self._assert(strict.get("status") == "FINAL", "chat loop did not reach FINAL")
+        self._assert(strict.get("final") == "PROBE_FINAL_DONE", "chat loop final text mismatch")
+        invoked = json.loads(result.session.path("invoked-skills.json").read_text(encoding="utf-8"))
+        self._assert(any(item.get("name") == "probe-skill" for item in invoked.get("skills", [])), "chat loop did not invoke probe skill")
+        briefs = result.session.path("briefs.jsonl").read_text(encoding="utf-8")
+        self._assert("PROBE_BRIEF_VISIBLE" in briefs, "brief action was not persisted")
+
+        question_result = runtime.run_chat_loop("Trigger explicit question pause", max_steps=2)
+        pending = load_pending_question(probe_root, question_result.session.id)
+        self._assert(question_result.exit_code == 0, "question pause should not be process failure")
+        self._assert(pending and pending.get("question") == "Choose path?", "chat loop did not persist explicit question")
+        answered_result = runtime.answer_question(question_result.session.id, "A", max_steps=2)
+        self._assert(answered_result.exit_code == 0, "answer should resume conversational loop successfully")
+        resumed_strict = json.loads(answered_result.session.path("strict-result.json").read_text(encoding="utf-8"))
+        self._assert(resumed_strict.get("final") == "PROBE_RESUMED_AFTER_ANSWER", "answer resume final text mismatch")
+        self._assert(answered_result.primary is not None, "answer resume did not produce a primary Codex run")
+        first_prompt = answered_result.primary.prompt_path.read_text(encoding="utf-8", errors="replace")
+        self._assert("Prior Conversational Session Resume Context" in first_prompt, "answer resume did not include prior session context")
+        self._assert("Source session:" in first_prompt and question_result.session.id in first_prompt, "answer resume did not identify source session")
+        self._assert("User answer: A" in first_prompt, "answer resume did not include answered question context")
+
+        final_question = runtime.run_chat_loop("Question mark final probe", max_steps=2)
+        self._assert(final_question.exit_code == 0, "question-looking final should complete")
+        self._assert(not load_pending_question(probe_root, final_question.session.id), "final text question must not create pending question")
+        return f"session={result.session.id}"
+
+    def _chat_plain_text_final_contract(self) -> str:
+        probe_root = self.project_root / ".selftest" / "chat-plain-text-final"
+        probe_root.mkdir(parents=True, exist_ok=True)
+        fake_codex = probe_root / "fake-codex-plain-chat.py"
+        fake_codex.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, pathlib, sys",
+                    "last_message = ''",
+                    "for index, value in enumerate(sys.argv):",
+                    "    if value == '--output-last-message' and index + 1 < len(sys.argv):",
+                    "        last_message = sys.argv[index + 1]",
+                    "if last_message:",
+                    "    pathlib.Path(last_message).write_text('PLAIN_CHAT_DONE', encoding='utf-8')",
+                    "print(json.dumps({'type':'turn.started'}))",
+                    "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'PLAIN_CHAT_DONE'}}))",
+                    "print(json.dumps({'type':'turn.completed'}))",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        runtime = CodexSkillRuntime(
+            project_root=probe_root,
+            codex=CodexCLI(executable=str(fake_codex)),
+            dry_run=False,
+            assume_yes=True,
+            qa_mode="off",
+        )
+        result = runtime.run_chat_loop("Return plain text", max_steps=2)
+        self._assert(result.exit_code == 0, f"plain chat should succeed, got {result.exit_code}")
+        strict = json.loads(result.session.path("strict-result.json").read_text(encoding="utf-8"))
+        self._assert(strict.get("status") == "FINAL", "plain chat did not finalize")
+        self._assert(strict.get("final") == "PLAIN_CHAT_DONE", "plain chat final text mismatch")
+        events = result.session.events_path.read_text(encoding="utf-8", errors="replace")
+        self._assert("codex.plain_text_final" in events, "plain text final event missing")
+        return f"session={result.session.id}"
+
+    def _ui_conversation_projection_contract(self) -> str:
+        server = _load_ui_server_module()
+        session_dir = self.project_root / ".selftest" / "ui-conversation-projection"
+        if session_dir.exists():
+            shutil.rmtree(session_dir)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "created_at": "2026-06-19T00:00:00",
+            "metadata": {"invocation": "chat", "arguments": "Generic conversational probe"},
+        }
+        summary = {
+            "command": "chat",
+            "arguments": "Generic conversational probe",
+            "status": "PASS",
+            "notes": "done",
+            "created_at": "2026-06-19T00:00:00",
+            "updated_at": "2026-06-19T00:00:03",
+        }
+        stdout = session_dir / "strict-step-1" / "stdout.jsonl"
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        stdout.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "timestamp": "2026-06-19T00:00:01",
+                            "item": {"type": "reasoning", "text": "visible reasoning summary"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "timestamp": "2026-06-19T00:00:02",
+                            "item": {
+                                "type": "message",
+                                "text": json.dumps(
+                                    {
+                                        "status": "action_required",
+                                        "summary": "Need tool",
+                                        "actions": [{"tool": "read_file", "parameters": {"path": "README.md"}}],
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "type": "turn.completed",
+                            "timestamp": "2026-06-19T00:00:03",
+                            "usage": {
+                                "input_tokens": 1,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 1,
+                                "reasoning_output_tokens": 1,
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        events = [
+            {"type": "codex.finish", "timestamp": "2026-06-19T00:00:03", "message": "Codex run finished", "data": {"returncode": 0, "stdout": str(stdout)}},
+            {"type": "assistant.brief", "timestamp": "2026-06-19T00:00:04", "message": "real assistant progress", "data": {"title": "Progress"}},
+            {"type": "tool.start", "timestamp": "2026-06-19T00:00:05", "message": "read_file: README.md", "data": {"parameters": {"path": "README.md"}}},
+            {"type": "question.pending", "timestamp": "2026-06-19T00:00:06", "message": "User input required", "data": {"question": "Choose direction?", "options": ["A", "B"]}},
+        ]
+        (session_dir / "events.jsonl").write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in events), encoding="utf-8")
+
+        rows = server._conversation_events_for_ui(session_dir, state, summary, jobs=[])
+        dialogue = [row for row in rows if _ui_dialogue_row(row)]
+        process = [row for row in rows if _ui_process_row(row)]
+        self._assert(any(row.get("kind") == "user_message" for row in dialogue), "UI dialogue missing user message")
+        self._assert(any(row.get("kind") == "assistant_message" and row.get("text") == "real assistant progress" for row in dialogue), "UI dialogue missing assistant brief")
+        self._assert(any(row.get("kind") == "question" and row.get("text") == "Choose direction?" for row in dialogue), "UI dialogue missing explicit question")
+        self._assert(not any(row.get("kind") == "reasoning" for row in dialogue), "reasoning summary must not enter middle dialogue")
+        self._assert(not any(row.get("kind") == "tool_call" for row in dialogue), "tool call must not enter middle dialogue")
+        self._assert(any(row.get("kind") == "reasoning" for row in process), "process stream missing reasoning summary")
+        self._assert(any(row.get("kind") == "tool_call" for row in process), "process stream missing tool call")
+        self._assert(any(row.get("kind") == "model_stream" for row in process), "process stream missing model stream")
+        return f"dialogue={','.join(str(row.get('kind')) for row in dialogue)} process={','.join(str(row.get('kind')) for row in process[:6])}"
+
     def _tool_executor_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-tools")
         hooks = HookDispatcher(self.project_root / ".claude" / "settings.json", self.project_root)
@@ -301,7 +531,7 @@ class SelfTester:
         self._assert(denied.status == "ERROR", ".claude write must be blocked")
         question = executor.execute({"tool": "ask_user_question", "reason": "test question", "parameters": {"question": "Proceed?", "options": ["yes", "no"]}})
         self._assert(question.status == "OK" and question.data.get("answer") == "yes", "assume-yes question failed")
-        bash = executor.execute({"tool": "bash", "reason": "test bash", "parameters": {"command": "python -c \"print('SELFTEST_BASH_OK')\"", "timeout": 30}})
+        bash = executor.execute({"tool": "bash", "reason": "test bash", "parameters": {"command": f"{shlex.quote(sys.executable)} -c \"print('SELFTEST_BASH_OK')\"", "timeout": 30}})
         self._assert(bash.status == "OK" and "SELFTEST_BASH_OK" in bash.data.get("stdout", ""), "bash tool failed")
         return f"session={session.id}"
 
@@ -594,6 +824,49 @@ class SelfTester:
         self._assert("User answer: B" in context, "pending question context did not include answer")
         return f"session={session.id}"
 
+    def _assistant_question_lifecycle_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-assistant-question-fixture")
+        fake_codex = session.dir / "fake-codex-question.py"
+        fake_codex.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, pathlib, sys",
+                    "last_message = ''",
+                    "for index, value in enumerate(sys.argv):",
+                    "    if value == '--output-last-message' and index + 1 < len(sys.argv):",
+                    "        last_message = sys.argv[index + 1]",
+                    "if last_message:",
+                    "    pathlib.Path(last_message).write_text('先确认一件事：你现在希望怎么开始？\\n1. 只有一个模糊想法\\n2. 已经有明确玩法\\n3. 已有项目要继续\\n', encoding='utf-8')",
+                    "print(json.dumps({'type': 'turn.started'}))",
+                    "print(json.dumps({'type': 'turn.completed'}))",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        runtime = CodexSkillRuntime(
+            project_root=self.project_root,
+            codex=CodexCLI(executable=str(fake_codex)),
+            dry_run=False,
+            assume_yes=False,
+            qa_mode="off",
+        )
+        result = runtime.chat_turn("I need help starting a project")
+        pending = load_pending_question(self.project_root, result.session.id)
+        state = json.loads(result.session.path("session-state.json").read_text(encoding="utf-8"))
+        summary = json.loads(result.session.path("summary.json").read_text(encoding="utf-8"))
+        tree = json.loads(result.session.path("task-tree.json").read_text(encoding="utf-8"))
+        self._assert(result.exit_code == 0, "assistant question lifecycle should not become a process failure")
+        self._assert(not pending, "plain assistant question text must not create a pending question")
+        self._assert(state.get("status") == "done", f"session status must be done, got {state.get('status')}")
+        self._assert(not state.get("waiting_question"), "session-state waiting_question should be absent")
+        self._assert(summary.get("status") == "PASS", "summary should remain pass for plain assistant question text")
+        question_nodes = [node for node in tree.get("nodes", []) if node.get("type") == "question" and node.get("status") == "waiting_user"]
+        self._assert(not question_nodes, "plain assistant question text should not add waiting question nodes")
+        return f"session={result.session.id}"
+
     def _project_memory_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-project-memory")
         executor = ToolExecutor(
@@ -744,7 +1017,8 @@ class SelfTester:
         self._assert(startup.load_agent("build-feature").metadata.get("name") == "build-feature", "nested plugin agent missing")
 
         arc = SkillRepositoryLoader(external / "arc")
-        self._assert(str(arc.load_skill("arc:audit").path).endswith("commands\\audit.md"), "top-level arc:audit should load command wrapper")
+        arc_audit_path = arc.load_skill("arc:audit").path
+        self._assert(arc_audit_path.parts[-2:] == ("commands", "audit.md"), "top-level arc:audit should load command wrapper")
         self._assert(arc.load_skill_by_reference("audit").metadata.get("context") == "fork", "Skill reference should prefer forked SKILL.md")
 
         coderabbit = SkillRepositoryLoader(external / "coderabbit-skills")
@@ -766,7 +1040,7 @@ class SelfTester:
         session = RuntimeSession(security, "selftest-plugin-hook")
         plugin_hooks = HookDispatcher([security / "hooks" / "hooks.json"], security)
         hook_results = plugin_hooks.fire(
-            "PreToolUse",
+            "PostToolUse",
             matcher_value="Write",
             payload={"tool": "Write", "path": "x.py"},
             session=session,
@@ -2040,6 +2314,204 @@ class SelfTester:
         self._assert("Structured Tool Transcript" in replay, "replay did not include structured tool transcript")
         return f"session={session.id}"
 
+    def _codex_stream_failure_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-codex-stream-failure")
+        fake_codex = session.path("fake-codex.py")
+        fake_codex.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json",
+                    "print(json.dumps({'type': 'thread.started', 'thread_id': 'selftest'}))",
+                    "print(json.dumps({'type': 'turn.started'}))",
+                    "print(json.dumps({'type': 'error', 'message': 'unexpected status 502 Bad Gateway'}))",
+                    "print(json.dumps({'type': 'turn.failed', 'error': {'message': 'upstream_error selftest'}}))",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        result = CodexCLI(
+            executable=str(fake_codex),
+            env={"SKILL_RUNTIME_CODEX_RETRY_ATTEMPTS": "1", "SKILL_RUNTIME_CODEX_RETRY_BACKOFF_SECONDS": "0"},
+        ).exec_prompt(
+            session=session,
+            label="stream-failure",
+            workdir=self.project_root,
+            prompt="probe",
+            dry_run=False,
+        )
+        self._assert(result.raw_returncode == 0, "fixture must simulate a zero process exit")
+        self._assert(result.returncode != 0, "turn.failed stream must become a failed runtime result")
+        self._assert(result.terminal_event == "turn.failed", "terminal stream event not captured")
+        self._assert("upstream_error selftest" in result.failure_reason, "failure reason not captured")
+        events = session.events_path.read_text(encoding="utf-8", errors="replace")
+        self._assert("codex.failure" in events, "codex.failure event missing from session timeline")
+        return f"session={session.id} returncode={result.returncode}"
+
+    def _codex_transient_retry_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-codex-transient-retry")
+        fake_codex = session.path("fake-codex-retry.py")
+        counter = session.path("attempt-counter.txt")
+        fake_codex.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, pathlib, sys",
+                    f"counter = pathlib.Path({str(counter)!r})",
+                    "attempt = int(counter.read_text(encoding='utf-8')) + 1 if counter.exists() else 1",
+                    "counter.write_text(str(attempt), encoding='utf-8')",
+                    "last_message = ''",
+                    "for index, value in enumerate(sys.argv):",
+                    "    if value == '--output-last-message' and index + 1 < len(sys.argv):",
+                    "        last_message = sys.argv[index + 1]",
+                    "print(json.dumps({'type': 'thread.started', 'thread_id': 'selftest'}))",
+                    "print(json.dumps({'type': 'turn.started'}))",
+                    "if attempt == 1:",
+                    "    print(json.dumps({'type': 'error', 'message': 'unexpected status 502 Bad Gateway'}))",
+                    "    print(json.dumps({'type': 'turn.failed', 'error': {'message': 'upstream_error retry selftest'}}))",
+                    "else:",
+                    "    if last_message:",
+                    "        pathlib.Path(last_message).write_text('RETRY_SELFTEST_SUCCESS', encoding='utf-8')",
+                    "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'RETRY_SELFTEST_SUCCESS'}}))",
+                    "    print(json.dumps({'type': 'turn.completed'}))",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        result = CodexCLI(
+            executable=str(fake_codex),
+            env={"SKILL_RUNTIME_CODEX_RETRY_ATTEMPTS": "2", "SKILL_RUNTIME_CODEX_RETRY_BACKOFF_SECONDS": "0"},
+        ).exec_prompt(
+            session=session,
+            label="transient-retry",
+            workdir=self.project_root,
+            prompt="probe",
+            dry_run=False,
+            timeout_seconds=10,
+        )
+        self._assert(result.returncode == 0, f"retry should recover to success, got {result.returncode}")
+        self._assert(result.raw_returncode == 0, "successful retry raw returncode should be zero")
+        self._assert(result.terminal_event == "turn.completed", "final terminal event should come from successful attempt")
+        self._assert(result.last_message.strip() == "RETRY_SELFTEST_SUCCESS", "canonical last message did not come from successful retry")
+        attempt_1 = session.dir / "transient-retry" / "attempts" / "attempt-1" / "result.json"
+        attempt_2 = session.dir / "transient-retry" / "attempts" / "attempt-2" / "result.json"
+        self._assert(attempt_1.exists() and attempt_2.exists(), "attempt evidence files missing")
+        first = json.loads(attempt_1.read_text(encoding="utf-8"))
+        second = json.loads(attempt_2.read_text(encoding="utf-8"))
+        self._assert(first.get("transient") is True and first.get("returncode") != 0, "first attempt was not classified as transient failure")
+        self._assert(second.get("returncode") == 0, "second attempt did not record success")
+        events = session.events_path.read_text(encoding="utf-8", errors="replace")
+        self._assert("codex.retry" in events, "codex.retry event missing from session timeline")
+        self._assert("attempts/attempt-1" in events and "attempts/attempt-2" in events, "attempt paths missing from event evidence")
+        return f"session={session.id} attempts=2"
+
+    def _codex_stall_kills_process_tree_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-codex-stall-kills-tree")
+        fake_codex = session.path("fake-codex-orphan.py")
+        child_pid_file = session.path("child-pid.txt")
+        fake_codex.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import pathlib, subprocess, sys, time",
+                    f"child_pid_file = pathlib.Path({str(child_pid_file)!r})",
+                    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])",
+                    "child_pid_file.write_text(str(child.pid), encoding='utf-8')",
+                    "time.sleep(120)",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        result = CodexCLI(
+            executable=str(fake_codex),
+            env={"SKILL_RUNTIME_CODEX_RETRY_ATTEMPTS": "1", "SKILL_RUNTIME_CODEX_STALL_TIMEOUT_SECONDS": "1"},
+        ).exec_prompt(
+            session=session,
+            label="stall-kills-tree",
+            workdir=self.project_root,
+            prompt="probe",
+            dry_run=False,
+            timeout_seconds=5,
+        )
+        self._assert(result.returncode == 125, f"stall should return 125, got {result.returncode}")
+        self._assert(child_pid_file.exists(), "fixture did not record child pid")
+        child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+        for _ in range(20):
+            if not _pid_exists(child_pid):
+                break
+            time.sleep(0.1)
+        self._assert(not _pid_exists(child_pid), f"stalled codex child process was not terminated: pid={child_pid}")
+        events = session.events_path.read_text(encoding="utf-8", errors="replace")
+        self._assert("Codex CLI produced no stream output" in events, "stall reason missing from session timeline")
+        return f"session={session.id} child_pid={child_pid}"
+
+    def _schema_fallback_contract(self) -> str:
+        session = RuntimeSession(self.project_root, "selftest-schema-fallback")
+        fake_codex = session.path("fake-codex-schema-fallback.py")
+        fake_codex.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, pathlib, sys",
+                    "last_message = ''",
+                    "schema_mode = '--output-schema' in sys.argv",
+                    "for index, value in enumerate(sys.argv):",
+                    "    if value == '--output-last-message' and index + 1 < len(sys.argv):",
+                    "        last_message = sys.argv[index + 1]",
+                    "print(json.dumps({'type': 'thread.started', 'thread_id': 'selftest'}))",
+                    "print(json.dumps({'type': 'turn.started'}))",
+                    "if schema_mode:",
+                    "    print(json.dumps({'type': 'error', 'message': 'unexpected status 502 Bad Gateway'}))",
+                    "    print(json.dumps({'type': 'turn.failed', 'error': {'message': 'upstream_error schema selftest'}}))",
+                    "else:",
+                    "    payload = {'status': 'final', 'final': 'SCHEMA_FALLBACK_OK'}",
+                    "    if last_message:",
+                    "        pathlib.Path(last_message).write_text(json.dumps(payload), encoding='utf-8')",
+                    "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': json.dumps(payload)}}))",
+                    "    print(json.dumps({'type': 'turn.completed'}))",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        executor = ToolExecutor(project_root=self.project_root, hooks=HookDispatcher([], self.project_root), session=session, assume_yes=True)
+        loop = StrictActionLoop(
+            codex=CodexCLI(executable=str(fake_codex), env={"SKILL_RUNTIME_CODEX_RETRY_ATTEMPTS": "1", "SKILL_RUNTIME_CODEX_RETRY_BACKOFF_SECONDS": "0"}),
+            session=session,
+            project_root=self.project_root,
+            schema_path=Path(__file__).resolve().parents[1] / "schemas" / "action-result.schema.json",
+            tool_executor=executor,
+            max_steps=1,
+            use_output_schema=True,
+        )
+        result = loop.run(
+            command="schema-fallback",
+            arguments="probe",
+            skill=MarkdownDocument(path=session.dir / "skill.md", metadata={"name": "schema-fallback"}, body="Test schema fallback.", raw=""),
+            agent=MarkdownDocument(path=session.dir / "agent.md", metadata={"name": "main-session"}, body="Execute.", raw=""),
+            context_bundle="",
+            assume_yes=True,
+            qa_mode="off",
+            dry_run=False,
+        )
+        self._assert(result.status == "FINAL", f"schema fallback should finish, got {result.status}: {result.final}")
+        self._assert(result.final == "SCHEMA_FALLBACK_OK", "schema fallback final text mismatch")
+        self._assert(len(result.codex_runs) == 2, "schema failure and fallback run should both be recorded")
+        self._assert(result.codex_runs[0].returncode != 0, "first schema run should fail")
+        self._assert(result.codex_runs[1].returncode == 0, "fallback run should succeed")
+        events = session.events_path.read_text(encoding="utf-8", errors="replace")
+        self._assert("codex.schema_fallback" in events, "schema fallback event missing")
+        self._assert("--output-schema" in json.dumps(result.codex_runs[0].command), "first run should use output schema")
+        self._assert("--output-schema" not in json.dumps(result.codex_runs[1].command), "fallback run should not use output schema")
+        return f"session={session.id}"
+
     def _model_effort_command_contract(self) -> str:
         session = RuntimeSession(self.project_root, "selftest-model-effort")
         result = CodexCLI(executable=self.codex_executable).exec_prompt(
@@ -2246,16 +2718,24 @@ class SelfTester:
         return f"session={result.session.id}"
 
     def _claude_tree_clean(self) -> str:
+        before = self.source_claude_diff_before
+        after = self._claude_diff_snapshot(self.source_root)
+        self._assert(after == before, ".claude diff changed during runtime selftest")
+        if after:
+            return ".claude diff unchanged; source tree already had local modifications"
+        return ".claude diff is empty"
+
+    def _claude_diff_snapshot(self, root: Path) -> str:
         completed = subprocess.run(
             ["git", "diff", "--", ".claude"],
-            cwd=str(self.source_root),
+            cwd=str(root),
             text=True,
             capture_output=True,
             check=False,
         )
-        self._assert(completed.returncode == 0, f"git diff failed: {completed.stderr}")
-        self._assert(completed.stdout.strip() == "", ".claude has local modifications")
-        return ".claude diff is empty"
+        if completed.returncode != 0:
+            raise SelfTestFailure(f"git diff failed: {completed.stderr}")
+        return completed.stdout.strip()
 
     def _contract_source_root(self) -> Path:
         for candidate in [self.loaded_root, *self.additional_dirs]:
@@ -2277,3 +2757,99 @@ class SelfTester:
     def _assert(self, condition: bool, message: str) -> None:
         if not condition:
             raise SelfTestFailure(message)
+
+
+def _select_checks(checks: list[object], selectors: list[str]) -> list[object]:
+    if not selectors:
+        return checks
+    normalized = [_normalize_check_name(selector) for selector in selectors if selector.strip()]
+    if not normalized:
+        return checks
+    selected = []
+    for check in checks:
+        name = _normalize_check_name(getattr(check, "__name__", ""))
+        if any(selector in name for selector in normalized):
+            selected.append(check)
+    return selected
+
+
+def _normalize_check_name(value: str) -> str:
+    return value.strip().lower().removeprefix("_").replace("_", "-")
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return str(pid) in completed.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _load_ui_server_module():
+    server_path = Path(__file__).resolve().parents[2] / "codex-skill-runtime-ui" / "backend" / "server.py"
+    backend_root = server_path.parent
+    if str(backend_root) not in sys.path:
+        sys.path.insert(0, str(backend_root))
+    spec = importlib.util.spec_from_file_location("runtime_ui_backend_server_selftest", server_path)
+    if spec is None or spec.loader is None:
+        raise SelfTestFailure(f"Cannot load UI backend server module: {server_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _ui_dialogue_row(row: dict[str, object]) -> bool:
+    role = str(row.get("role") or "")
+    kind = str(row.get("kind") or "")
+    if role in {"user", "你"}:
+        return True
+    if kind == "reasoning":
+        return False
+    if role == "assistant" or kind == "assistant_message":
+        return True
+    if kind in {"question", "answer"}:
+        return True
+    return False
+
+
+def _ui_process_row(row: dict[str, object]) -> bool:
+    if _ui_dialogue_row(row):
+        return False
+    role = str(row.get("role") or "")
+    kind = str(row.get("kind") or "")
+    process_kinds = {
+        "runtime_process",
+        "tool_call",
+        "tool_result",
+        "model_start",
+        "model_finish",
+        "model_stream",
+        "job",
+        "hook",
+        "session",
+        "memory",
+        "skill",
+        "plan",
+        "bridge",
+        "voice",
+        "ide",
+        "mcp",
+        "summary",
+        "reasoning",
+        "error",
+        "event",
+    }
+    return kind in process_kinds or role in {"runtime", "tool", "system"}

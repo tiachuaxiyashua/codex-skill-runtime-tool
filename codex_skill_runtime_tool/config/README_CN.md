@@ -74,6 +74,27 @@ SKILL_RUNTIME_CAPABILITY_FORGE_DESCRIPTION=Stability Matrix Forge or A1111-compa
 
 或在 `.claude-plugin\plugin.json` 中写 `capabilities` 字段。
 
+## 外部服务启动配置
+
+runtime 启动时不会自动启动 Forge、ComfyUI 或其他素材/工具服务。需要时在 Web UI 的“外部服务”面板手动启动。
+
+可通过通用 service registry 配置服务：
+
+```env
+SKILL_RUNTIME_SERVICES_JSON={"services":[{"id":"forge","label":"Forge / A1111","endpoint":"http://127.0.0.1:7860","health_url":"http://127.0.0.1:7860/sdapi/v1/options","start_cmd":"..."}]}
+```
+
+字段含义：
+
+- `id`：服务唯一标识。
+- `label`：UI 展示名称。
+- `kind`：服务类型，只用于说明。
+- `endpoint`：服务基础地址。
+- `health_url`：健康检查地址。
+- `start_cmd`：用户点击“启动”时执行的命令。
+
+这套机制是通用的，不只服务于游戏开发。Forge、ComfyUI、TTS、数据库、本地 MCP 服务都可以按同一格式注册。
+
 ## 当前目录约定
 
 runtime 自己产生的文件都在工程内：

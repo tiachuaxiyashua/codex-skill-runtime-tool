@@ -114,6 +114,24 @@ class JobRegistry:
     def list(self, *, limit: int = 300) -> list[dict[str, Any]]:
         return self._load()[:limit]
 
+    def delete(self, job_id: str) -> bool:
+        jobs = self._load()
+        next_jobs = [item for item in jobs if item.get("id") != job_id]
+        if len(next_jobs) == len(jobs):
+            return False
+        self._write(next_jobs)
+        return True
+
+    def delete_many(self, job_ids: set[str]) -> int:
+        if not job_ids:
+            return 0
+        jobs = self._load()
+        next_jobs = [item for item in jobs if str(item.get("id") or "") not in job_ids]
+        removed = len(jobs) - len(next_jobs)
+        if removed:
+            self._write(next_jobs)
+        return removed
+
     def cancel(self, job_id: str) -> dict[str, Any]:
         record = self.get(job_id)
         if record is None:

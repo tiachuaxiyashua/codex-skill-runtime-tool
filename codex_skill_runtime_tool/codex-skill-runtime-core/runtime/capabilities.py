@@ -124,6 +124,21 @@ def _from_env() -> list[Capability]:
                 )
             )
 
+    raw_services = os.environ.get("SKILL_RUNTIME_SERVICES_JSON") or os.environ.get("CODEX_SKILL_RUNTIME_SERVICES_JSON")
+    if raw_services:
+        try:
+            records.extend(_capabilities_from_services(json.loads(raw_services)))
+        except ValueError:
+            records.append(
+                Capability(
+                    name="invalid-env-services",
+                    kind="error",
+                    status="error",
+                    source="env:SKILL_RUNTIME_SERVICES_JSON",
+                    description="SKILL_RUNTIME_SERVICES_JSON is not valid JSON.",
+                )
+            )
+
     grouped: dict[str, dict[str, str]] = {}
     prefixes = ("SKILL_RUNTIME_CAPABILITY_", "CODEX_SKILL_RUNTIME_CAPABILITY_")
     for key, value in os.environ.items():
@@ -150,6 +165,32 @@ def _from_env() -> list[Capability]:
                 description=values.get("description", ""),
                 source="env",
                 metadata={key: value for key, value in values.items() if key not in {"provider", "namespace", "kind", "type", "status", "endpoint", "url", "baseurl", "description"}},
+            )
+        )
+    return records
+
+
+def _capabilities_from_services(payload: Any) -> list[Capability]:
+    services = payload.get("services", []) if isinstance(payload, dict) else payload
+    if not isinstance(services, list):
+        return []
+    records: list[Capability] = []
+    for item in services:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_name(str(item.get("id") or item.get("name") or item.get("label") or "service"))
+        endpoint = str(item.get("endpoint") or item.get("url") or "")
+        records.append(
+            Capability(
+                name=name,
+                provider=str(item.get("provider") or ""),
+                namespace=str(item.get("namespace") or ""),
+                kind=str(item.get("kind") or item.get("type") or "external-service"),
+                status=str(item.get("status") or "configured"),
+                endpoint=endpoint,
+                description=str(item.get("description") or ""),
+                source="env:SKILL_RUNTIME_SERVICES_JSON",
+                metadata={key: value for key, value in item.items() if key not in {"id", "name", "label", "provider", "namespace", "kind", "type", "status", "endpoint", "url", "description", "start_cmd", "start", "command"}},
             )
         )
     return records

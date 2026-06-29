@@ -6,7 +6,7 @@ param(
     [switch]$CheckOnly,
     [switch]$NoBrowser,
     [switch]$NoStartUi,
-    [switch]$NoStartConfiguredDeps
+    [switch]$StartConfiguredDeps
 )
 
 $ErrorActionPreference = "Stop"
@@ -134,54 +134,6 @@ function Test-HttpEndpoint {
         Write-Host "       $($_.Exception.Message)"
         return $false
     }
-}
-
-function Wait-HttpEndpoint {
-    param(
-        [string]$Name,
-        [string]$Url,
-        [int]$TimeoutSec = 180
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Url)) {
-        return $false
-    }
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 3
-            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
-                Write-Host "[ OK ] $Name endpoint became reachable: $Url ($($response.StatusCode))"
-                return $true
-            }
-        }
-        catch {
-            Start-Sleep -Seconds 3
-        }
-    }
-
-    Write-Host "[WARN] $Name endpoint did not become reachable within $TimeoutSec seconds: $Url"
-    return $false
-}
-
-function Start-ConfiguredCommand {
-    param(
-        [string]$Name,
-        [string]$Command
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Command)) {
-        Write-Host "[INFO] No startup command configured for $Name."
-        return
-    }
-
-    Write-Host "[RUN ] Starting configured dependency: $Name"
-    $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Command))
-    Start-Process -FilePath "powershell.exe" `
-        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand) `
-        -WorkingDirectory $WorkspaceRoot `
-        -WindowStyle Hidden | Out-Null
 }
 
 function Test-UiHealth {
@@ -332,38 +284,16 @@ $comfyBase = Get-RuntimeValue -Values $envValues -Names @("SKILL_RUNTIME_ENV_COM
 $forgeOk = Test-HttpEndpoint -Name "Forge/A1111" -Url (Join-EndpointPath $forgeBase "/sdapi/v1/options")
 $comfyOk = Test-HttpEndpoint -Name "ComfyUI" -Url (Join-EndpointPath $comfyBase "/system_stats")
 
-if ((-not $NoStartConfiguredDeps) -and (-not $CheckOnly)) {
-    $startedForge = $false
-    $startedComfy = $false
-    if (-not $forgeOk) {
-        $forgeCommand = Get-RuntimeValue -Values $envValues -Names @("SKILL_RUNTIME_START_FORGE_CMD") -Default ""
-        if (-not [string]::IsNullOrWhiteSpace($forgeCommand)) {
-            Start-ConfiguredCommand -Name "Forge/A1111" -Command $forgeCommand
-            $startedForge = $true
-        }
-        else {
-            Start-ConfiguredCommand -Name "Forge/A1111" -Command $forgeCommand
-        }
-    }
-    if (-not $comfyOk) {
-        $comfyCommand = Get-RuntimeValue -Values $envValues -Names @("SKILL_RUNTIME_START_COMFYUI_CMD") -Default ""
-        if (-not [string]::IsNullOrWhiteSpace($comfyCommand)) {
-            Start-ConfiguredCommand -Name "ComfyUI" -Command $comfyCommand
-            $startedComfy = $true
-        }
-        else {
-            Start-ConfiguredCommand -Name "ComfyUI" -Command $comfyCommand
-        }
-    }
-    if ($startedForge) {
-        $forgeOk = Wait-HttpEndpoint -Name "Forge/A1111" -Url (Join-EndpointPath $forgeBase "/sdapi/v1/options")
-    }
-    if ($startedComfy) {
-        $comfyOk = Wait-HttpEndpoint -Name "ComfyUI" -Url (Join-EndpointPath $comfyBase "/system_stats")
-    }
+if ($StartConfiguredDeps) {
+    Write-Host "[WARN] -StartConfiguredDeps is deprecated and ignored."
+    Write-Host "       Start external services manually from the Runtime UI when a task needs them."
 }
-elseif ($CheckOnly) {
+
+if ($CheckOnly) {
     Write-Host "[INFO] Check-only mode will not start configured dependencies."
+}
+else {
+    Write-Host "[INFO] External services are not auto-started. Start configured services manually from the Runtime UI when needed."
 }
 
 Write-Host ""

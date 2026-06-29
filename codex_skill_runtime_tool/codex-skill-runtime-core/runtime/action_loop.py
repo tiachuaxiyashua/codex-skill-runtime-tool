@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,7 @@ class StrictActionLoop:
         model: str | None = None,
         reasoning_effort: str | None = None,
         use_output_schema: bool = True,
+        allow_plain_text_final: bool = False,
     ) -> None:
         self.codex = codex
         self.session = session
@@ -47,6 +49,7 @@ class StrictActionLoop:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.use_output_schema = use_output_schema
+        self.allow_plain_text_final = allow_plain_text_final
 
     def run(
         self,
@@ -90,15 +93,22 @@ class StrictActionLoop:
                 prompt=active_prompt,
                 output_schema=output_schema,
                 dry_run=dry_run,
+                stall_timeout_seconds=_schema_stall_timeout_seconds() if output_schema is not None else None,
+                retry_attempts=_schema_retry_attempts() if output_schema is not None else None,
+                retry_backoff_seconds=_schema_retry_backoff_seconds() if output_schema is not None else None,
                 model=self.model,
                 reasoning_effort=self.reasoning_effort,
             )
             if not dry_run and output_schema is not None and run.returncode != 0:
+                codex_runs.append(run)
                 schema_failed = True
                 self.session.event(
                     "codex.schema_fallback",
                     f"Strict step {step} failed with schema; disabling schema for this session and retrying prompt-only JSON mode.",
                     returncode=run.returncode,
+                    raw_returncode=run.raw_returncode,
+                    terminal_event=run.terminal_event,
+                    failure_reason=run.failure_reason,
                     stderr=str(run.stderr_path),
                 )
                 run = self.codex.exec_prompt(
@@ -116,6 +126,13 @@ class StrictActionLoop:
                 return ActionLoopResult("DRY-RUN", "Strict prompt prepared.", codex_runs, tool_results)
             if run.returncode != 0:
                 stderr = run.stderr_path.read_text(encoding="utf-8", errors="replace") if run.stderr_path.exists() else ""
+                if "502 Bad Gateway" in stderr or "upstream_error" in stderr:
+                    return ActionLoopResult(
+                        "BLOCKED",
+                        f"Codex upstream failed during strict step {step}: {stderr[-2000:]}",
+                        codex_runs,
+                        tool_results,
+                    )
                 return ActionLoopResult(
                     "BLOCKED",
                     f"Codex strict step {step} failed with exit {run.returncode}: {stderr[-2000:]}",
@@ -130,7 +147,25 @@ class StrictActionLoop:
                     tool_results,
                 )
 
-            response = parse_json_response(run.last_message)
+            try:
+                response = parse_json_response(run.last_message)
+            except (json.JSONDecodeError, ValueError) as exc:
+                if self.allow_plain_text_final:
+                    final_text = run.last_message.strip()
+                    self.session.event(
+                        "codex.plain_text_final",
+                        f"Accepted plain-text final response for {command} step {step}.",
+                        label=run.label,
+                        parse_error=str(exc),
+                        last_message=str(run.last_message_path),
+                    )
+                    return ActionLoopResult("FINAL", final_text, codex_runs, tool_results)
+                return ActionLoopResult(
+                    "BLOCKED",
+                    f"Codex strict step {step} returned invalid JSON: {exc}",
+                    codex_runs,
+                    tool_results,
+                )
             self.session.write_json(f"strict-step-{step}/response.json", response)
             status = str(response.get("status"))
             if status == "final":
@@ -140,8 +175,8 @@ class StrictActionLoop:
             if status != "action_required":
                 return ActionLoopResult("BLOCKED", f"Unknown status: {status}", codex_runs, tool_results)
 
-            actions = response.get("actions") or []
-            if not isinstance(actions, list) or not actions:
+            actions = _normalize_actions(response.get("actions"))
+            if not actions:
                 return ActionLoopResult("BLOCKED", "action_required response contained no actions", codex_runs, tool_results)
 
             step_observation: dict[str, Any] = {"step": step, "actions": []}
@@ -251,73 +286,7 @@ class StrictActionLoop:
 
         return f"""{base}{invoked_section}{session_memory_section}
 
-## Strict Runtime Action Mode
-
-You must return JSON matching the provided schema. Do not write files directly.
-Request runtime-owned actions instead.
-
-Available tools:
-
-- read_file: parameters `path`, optional `max_chars`
-- glob: parameters `pattern`
-- grep: parameters `pattern`, optional `path`
-- write_file: parameters `path`, `content`
-- edit_file: parameters `path`, `old`, `new`
-- multi_edit: parameters `path`, `edits` where edits is a list of objects with `old` and `new`
-- bash: parameters `command`, optional `timeout`
-- powershell: parameters `command`, optional `timeout`
-- terminal_capture: parameters `command`, optional `shell`, optional `timeout`; persists stdout/stderr evidence
-- repl: parameters `language` (`python`), `code`
-- sleep: parameters `seconds`; bounded wait for polling
-- task or agent: parameters `agent` or `subagent_type`, `purpose`, `prompt`, optional `name`, optional `run_in_background`/`background` or `wait=false`
-- task_create: parameters `subject`, `description`, optional `activeForm`, `owner`, `metadata`; creates a task-list item, not a worker
-- task_get: parameters `taskId`; reads a task-list item
-- task_list: optional `status`; lists task-list items
-- task_output: parameters `to` or `worker_id` or `task_id`, optional `block` (default true), optional `timeout` milliseconds, optional `full`, optional `max_chars`; reads background worker/agent output
-- task_update: parameters `taskId`, optional `subject`, `description`, `activeForm`, `status`, `owner`, `addBlocks`, `addBlockedBy`, `metadata`
-- ask_user_question: parameters `question`, optional `options`, optional `default`
-- todo_write: parameters `items` list, or `todos` list
-- skill: parameters `name`, optional `arguments`; loads another model-invocable skill by name
-- discover_skills: optional `query`, `limit`, `model_only`; lists visible skills without loading full bodies
-- tool_search: parameters `query`, optional `limit`; searches runtime tools, visible skills, capabilities, and MCP servers
-- plan_mode: parameters `operation` enter/exit/verify plus plan/evidence fields; aliases EnterPlanMode/ExitPlanMode/VerifyPlanExecution also route here
-- config: parameters `operation` inspect/plugin_enable/plugin_disable
-- notebook_edit: parameters `notebook_path`, `cell_number`, `source`, optional `cell_type`, optional `edit_mode`
-- snip: parameters `path`, optional `start_line`, optional `end_line`
-- send_user_file: parameters `path`, optional `copy`; registers a user-provided file in session state
-- review_artifact: parameters `artifact` or `path`, optional `verdict`, optional `notes`
-- brief or SendUserMessage: parameters `title`, `content`; persists user-visible brief text
-- remote_trigger: records a generic remote trigger request
-- structured_output: records schema/value structured output
-- workflow: parameters `operation`, optional `id`/`name`, optional `status`, `steps`, `summary`
-- team_create/team_delete: parameters `name`, optional `members`, optional `purpose`
-- enter_worktree/exit_worktree: create or record exit/removal for a git worktree
-- cron_create/cron_list/cron_delete: persistent schedule records
-- monitor: reads current session/tree/worker/job state
-- lsp: parameters `command`; direct LSP command runner
-- project_memory_read: parameters optional `section`; reads runtime-owned global style, asset manifest, or project notes
-- project_memory_write: parameters `section`, `content`, optional `append`; writes runtime-owned global style or project notes
-- asset_register: parameters `asset` object; appends one generated or imported asset record to runtime-owned asset manifest
-- capability_list: optional `namespace`; lists generic runtime capabilities discovered from loaded skill/plugin manifests and runtime env
-- send_message: parameters `to`, `message`; continues a previous worker returned by task/agent
-- task_stop: parameters `to` or `task_id`, optional `reason`; stops a worker in the runtime registry
-- memory_read: parameters optional `agent`, optional `scope`
-- memory_write: parameters `content`, optional `agent`, optional `scope`, optional `append`
-- bridge: parameters `operation`; supports register/enqueue/poll/ack/heartbeat/session_event/archive/reconnect
-- voice: parameters `operation`; supports start/append/finalize/load/latest transcript injection
-- ide: parameters `operation`; supports selection/diagnostics/lsp_command/load context
-- web_fetch: parameters `url`
-- web_search: parameters `query`
-- web_browser: parameters `operation` open/click/find/current; provides a lightweight stateful browser
-- mcp: parameters `tool`, optional `arguments`; supports configured stdio, HTTP, SSE, and WebSocket MCP servers. Remote OAuth uses stored tokens, headers, headersHelper, authCommand/tokenCommand/refreshCommand, and explicit BLOCKED results when user authorization material is still missing.
-- mcp_auth: parameters `server`, optional `callback_url` or `code`; starts or completes OAuth for a configured MCP server. Dynamic `mcp__<server>__authenticate` actions are also accepted.
-- list_mcp_resources: optional `server`, optional `cursor`
-- read_mcp_resource: parameters `uri`, optional `server`
-- mcp_elicitation: parameters `operation` request/respond/list; records elicitation pause/answer lifecycle
-
-Return `status: action_required` with actions when you need runtime work.
-Return `status: final` only when the workflow has enough evidence to stop.
-Return `status: blocked` when required user input or missing prerequisites prevent progress.
+{_strict_action_instructions()}
 
 Current strict step: {step}
 
@@ -347,6 +316,129 @@ def _blocked_question_message(result: ToolResult) -> str:
 
 def _action_tool_name(action: dict[str, Any]) -> str:
     return str(action.get("tool", action.get("type", ""))).strip().lower().replace("-", "_")
+
+
+def _strict_action_instructions() -> str:
+    if _lean_context_enabled():
+        return """## Strict Runtime Action Mode
+
+Return JSON matching the provided schema. Do not call tools as functions. Do not write prose before the JSON.
+You request runtime-owned work by putting tool names inside the JSON `actions` array.
+
+Core tools:
+- read_file: parameters `path`, optional `max_chars`
+- glob: parameters `pattern`
+- grep: parameters `pattern`, optional `path`
+- write_file: parameters `path`, `content`
+- edit_file: parameters `path`, `old`, `new`
+- bash: parameters `command`, optional `timeout`
+- task or agent: parameters `agent` or `subagent_type`, `purpose`, `prompt`
+- ask_user_question: parameters `question`, optional `options`, optional `default`
+
+Return `status: action_required` with actions when you need runtime work.
+Return `status: final` only when the workflow has enough evidence to stop.
+Return `status: blocked` when required user input or missing prerequisites prevent progress.
+
+Example write action:
+```json
+{
+  "status": "action_required",
+  "summary": "Create the requested file.",
+  "actions": [
+    {
+      "tool": "write_file",
+      "parameters": {
+        "path": "index.html",
+        "content": "<!doctype html>..."
+      }
+    }
+  ],
+  "final": ""
+}
+```"""
+    return """## Strict Runtime Action Mode
+
+You must return JSON matching the provided schema. Do not write files directly.
+Request runtime-owned actions instead.
+
+Available tools:
+
+- read_file: parameters `path`, optional `max_chars`
+- glob: parameters `pattern`
+- grep: parameters `pattern`, optional `path`
+- write_file: parameters `path`, `content`
+- edit_file: parameters `path`, `old`, `new`
+- multi_edit: parameters `path`, `edits` where edits is a list of objects with `old` and `new`
+- bash: parameters `command`, optional `timeout`
+- powershell: parameters `command`, optional `timeout`
+- terminal_capture: parameters `command`, optional `shell`, optional `timeout`; persists stdout/stderr evidence
+- repl: parameters `language` (`python`), `code`
+- sleep: parameters `seconds`; bounded wait for polling
+- task or agent: parameters `agent` or `subagent_type`, `purpose`, `prompt`, optional `name`, optional `run_in_background`/`background` or `wait=false`
+- task_create/task_get/task_list/task_update/task_output/task_stop: task-list and worker lifecycle tools
+- ask_user_question: parameters `question`, optional `options`, optional `default`
+- todo_write: parameters `items` list, or `todos` list
+- skill/discover_skills/tool_search/capability_list/config: skill and capability discovery/configuration
+- plan_mode/workflow/review_artifact/brief/structured_output/monitor: planning, reporting, and state tools
+- project_memory_read/project_memory_write/memory_read/memory_write/asset_register: runtime memory and asset tools
+- bridge/voice/ide/web_fetch/web_search/web_browser/mcp/mcp_auth/list_mcp_resources/read_mcp_resource/mcp_elicitation: external capability tools
+
+Return `status: action_required` with actions when you need runtime work.
+Return `status: final` only when the workflow has enough evidence to stop.
+Return `status: blocked` when required user input or missing prerequisites prevent progress."""
+
+
+def _schema_retry_attempts() -> int:
+    return max(1, _env_int("SKILL_RUNTIME_CODEX_SCHEMA_RETRY_ATTEMPTS", default=1))
+
+
+def _schema_stall_timeout_seconds() -> int | None:
+    value = _env_int("SKILL_RUNTIME_CODEX_SCHEMA_STALL_TIMEOUT_SECONDS", default=45)
+    return value if value > 0 else None
+
+
+def _schema_retry_backoff_seconds() -> float:
+    value = os.environ.get("SKILL_RUNTIME_CODEX_SCHEMA_RETRY_BACKOFF_SECONDS", "").strip()
+    if not value:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return 0.0
+
+
+def _env_int(name: str, *, default: int) -> int:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _lean_context_enabled() -> bool:
+    value = os.environ.get("SKILL_RUNTIME_CONTEXT_MODE") or os.environ.get("CODEX_SKILL_RUNTIME_CONTEXT_MODE") or ""
+    return value.strip().lower() in {"lean", "lite", "minimal", "local"}
+
+
+def _normalize_actions(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, dict):
+        return []
+    if "tool" in value or "type" in value:
+        return [value]
+
+    actions: list[dict[str, Any]] = []
+    for tool, parameters in value.items():
+        if not isinstance(tool, str):
+            continue
+        if isinstance(parameters, dict):
+            actions.append({"tool": tool, "parameters": parameters})
+        else:
+            actions.append({"tool": tool, "parameters": {"value": parameters}})
+    return actions
 
 
 def _raw_json_prompt(prompt: str) -> str:
